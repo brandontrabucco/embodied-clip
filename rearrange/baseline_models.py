@@ -5,14 +5,27 @@ from typing import (
     Union,
     Dict,
     Any,
+    Callable,
 )
+
+import copy
+import math
 
 import gym
 import gym.spaces
 import numpy as np
 import torch
 import torch.nn as nn
+
 from torch import Tensor
+from torch.nn import functional as F
+from torch.nn import Module
+from torch.nn import MultiheadAttention
+from torch.nn import ModuleList
+from torch.nn.init import xavier_uniform_
+from torch.nn import Dropout
+from torch.nn import Linear
+from torch.nn import LayerNorm
 
 from allenact.algorithms.onpolicy_sync.policy import (
     ActorCriticModel,
@@ -217,6 +230,348 @@ class ResNetRearrangeActorCriticRNN(RearrangeActorCriticSimpleConvRNN):
         x = x.view(*batch_shape, -1)
 
         x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
+
+        ac_output = ActorCriticOutput(
+            distributions=self.actor(x), values=self.critic(x), extras={}
+        )
+
+        return ac_output, memory.set_tensor("rnn", rnn_hidden_states)
+
+
+class PositionalEncoding(nn.Module):
+    
+    def __init__(self, num_octaves=8, start_octave=-5):
+        
+        super().__init__()
+        
+        self.num_octaves = num_octaves
+        self.start_octave = start_octave
+
+    def forward(self, coords):
+        
+        embed_fns = []
+        shape = list(coords.shape)
+        shape[-1] = int(shape[-1]) * self.num_octaves
+
+        octaves = torch.arange(self.start_octave, self.start_octave + self.num_octaves)
+        octaves = octaves.float().to(coords)
+        multipliers = 2**octaves * math.pi
+        
+        coords = coords.unsqueeze(-1)
+        while len(multipliers.shape) < len(coords.shape):
+            multipliers = multipliers.unsqueeze(0)
+
+        scaled_coords = coords * multipliers
+
+        sines = torch.sin(scaled_coords).reshape(shape)
+        cosines = torch.cos(scaled_coords).reshape(shape)
+
+        result = torch.cat((sines, cosines), -1)
+        return result
+
+
+def _get_clones(module, N):
+    return ModuleList([copy.deepcopy(module) for i in range(N)])
+
+
+class TransformerEncoderLayer(Module):
+    
+    __constants__ = ['batch_first', 'norm_first']
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
+                 activation: Union[str, Callable[[Tensor], Tensor]] = F.relu,
+                 layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = True,
+                 device=None, dtype=None, src1_dim=None, src2_dim=None) -> None:
+        
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super(TransformerEncoderLayer, self).__init__()
+        
+        self.self_attn1 = MultiheadAttention(d_model, nhead, dropout=dropout,
+                                             batch_first=batch_first,
+                                             **factory_kwargs,
+                                             kdim=src1_dim, 
+                                             vdim=src2_dim)
+        
+        self.self_attn2 = MultiheadAttention(d_model, nhead, dropout=dropout, 
+                                             batch_first=batch_first,
+                                             **factory_kwargs,
+                                             kdim=src2_dim, 
+                                             vdim=src1_dim)
+        
+        # Implementation of Feedforward model
+        self.linear1 = Linear(d_model, dim_feedforward, **factory_kwargs)
+        self.dropout = Dropout(dropout)
+        self.linear2 = Linear(dim_feedforward, d_model, **factory_kwargs)
+
+        self.norm_first = norm_first
+        
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.norm3 = LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+        self.dropout3 = Dropout(dropout)
+
+        if activation == "relu":
+            activation = F.relu
+        elif activation == "gelu":
+            activation = F.gelu
+
+        # We can't test self.activation in forward() in TorchScript,
+        # so stash some information about it instead.
+        if activation is F.relu:
+            self.activation_relu_or_gelu = 1
+        elif activation is F.gelu:
+            self.activation_relu_or_gelu = 2
+        else:
+            self.activation_relu_or_gelu = 0
+        self.activation = activation
+        
+        self.attention_weights1 = None
+        self.attention_weights2 = None
+
+    def __setstate__(self, state):
+        
+        super(TransformerEncoderLayer, self).__setstate__(state)
+        
+        if not hasattr(self, 'activation'):
+            self.activation = F.relu
+
+    def forward(self, x: Tensor, src1: Tensor, src2: Tensor, 
+                src_mask: Optional[Tensor] = None,
+                src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+        
+        if self.norm_first:
+            
+            dx, w1 = self._sa_block1(self.norm1(x), src1, src2, 
+                                     src_mask, src_key_padding_mask)
+            
+            x = x + dx
+            
+            dx, w2 = self._sa_block2(self.norm2(x), src2, src1, 
+                                     src_mask, src_key_padding_mask)
+            
+            x = x + dx
+            x = x + self._ff_block(self.norm3(x))
+            
+        else:
+            
+            dx, w1 = self._sa_block1(x, src1, src2, 
+                                     src_mask, src_key_padding_mask)
+            
+            x = self.norm1(x + dx)
+            
+            dx, w2 = self._sa_block2(x, src2, src1, 
+                                     src_mask, src_key_padding_mask)
+            
+            x = self.norm2(x + dx)
+            x = self.norm3(x + self._ff_block(x))
+            
+        self.attention_weights1 = w1
+        self.attention_weights2 = w2
+
+        return x
+
+    # self-attention block
+    def _sa_block1(self, q: Tensor, k: Tensor, v: Tensor,
+                   attn_mask: Optional[Tensor], 
+                   key_padding_mask: Optional[Tensor]) -> Tensor:
+        x, w = self.self_attn1(q, k, v,
+                               attn_mask=attn_mask,
+                               key_padding_mask=key_padding_mask,
+                               need_weights=True, average_attn_weights=True)
+        return self.dropout1(x), w
+
+    # self-attention block
+    def _sa_block2(self, q: Tensor, k: Tensor, v: Tensor,
+                   attn_mask: Optional[Tensor], 
+                   key_padding_mask: Optional[Tensor]) -> Tensor:
+        x, w = self.self_attn2(q, k, v,
+                               attn_mask=attn_mask,
+                               key_padding_mask=key_padding_mask,
+                               need_weights=True, average_attn_weights=True)
+        return self.dropout2(x), w
+
+    # feed forward block
+    def _ff_block(self, x: Tensor) -> Tensor:
+        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        return self.dropout3(x)
+    
+    
+class TransformerEncoder(Module):
+
+    def __init__(self, encoder_layer, num_layers):
+        
+        super(TransformerEncoder, self).__init__()
+        
+        self.layers = _get_clones(encoder_layer, num_layers)
+        self.num_layers = num_layers
+        
+        self.attention_weights1 = None
+        self.attention_weights2 = None
+
+    def forward(self, x: Tensor, src1: Tensor, src2: Tensor, mask: Optional[Tensor] = None, 
+                src_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+
+        for mod in self.layers:
+            x = mod(x, src1, src2, src_mask=mask, 
+                    src_key_padding_mask=src_key_padding_mask)
+            
+        self.attention_weights1 = torch.stack([
+            mod.attention_weights1 for mod in self.layers], dim=0).mean(dim=0)
+        
+        self.attention_weights2 = torch.stack([
+            mod.attention_weights2 for mod in self.layers], dim=0).mean(dim=0)
+
+        return x
+
+
+class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
+    def __init__(
+        self,
+        action_space: gym.spaces.Discrete,
+        observation_space: gym.spaces.Dict,
+        rgb_uuid: str,
+        unshuffled_rgb_uuid: str,
+        hidden_size=512,
+        num_rnn_layers=1,
+        rnn_type="GRU",
+    ):
+        """A CNN->RNN rearrangement model that expects ResNet features instead
+        of RGB images.
+
+        Nearly identical to `RearrangeActorCriticSimpleConvRNN` but
+        `rgb_uuid` should now be the unique id of the ResNetPreprocessor
+        used to featurize RGB images using a pretrained ResNet before
+        they're passed to this model.
+        """
+        self.visual_attention: Optional[nn.Module] = None
+        super().__init__(**prepare_locals_for_super(locals()))
+
+        patch_size = 768
+        num_octaves = 8
+        start_octave = -5
+        num_encoder_layers = 6
+        dim_head = 64
+        nhead = hidden_size // dim_head
+        dropout = 0.1
+        activation = 'gelu'
+        layer_norm_eps = 1e-5
+        
+        d_model = nhead * dim_head
+        
+        self.pos_encoding = PositionalEncoding(
+            num_octaves=num_octaves, start_octave=start_octave)
+        
+        self.class_embedding = nn.Embedding(64, patch_size)
+        self.instance_embedding = nn.Embedding(64, patch_size)
+        
+        self.norm1 = nn.LayerNorm(num_octaves * 2 * 5)
+        self.norm2 = nn.LayerNorm(patch_size)
+        
+        encoder_layer = TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model * 2,
+            dropout=dropout, 
+            activation=activation,
+            layer_norm_eps=layer_norm_eps,
+            batch_first=True,
+            src1_dim=num_octaves * 2 * 5, 
+            src2_dim=patch_size
+        )
+        
+        self.nerf_transformer = TransformerEncoder(
+            encoder_layer, num_encoder_layers
+        )
+        
+        self.register_parameter("rays_token_embedding", 
+                                nn.Parameter(torch.randn(1, 2, num_octaves * 2 * 5)))
+        self.register_parameter("rgbs_token_embedding", 
+                                nn.Parameter(torch.randn(1, 2, patch_size)))
+
+    def _create_visual_encoder(self) -> nn.Module:
+        a, b = [
+            self.observation_space[k].shape[0]
+            for k in [self.rgb_uuid, self.unshuffled_rgb_uuid]
+        ]
+        assert a == b
+        self.visual_attention = nn.Sequential(
+            nn.Conv2d(3 * a, 32, 1,), nn.ReLU(inplace=True), nn.Conv2d(32, 1, 1,),
+        )
+        visual_encoder = nn.Sequential(
+            nn.Conv2d(3 * a, self._hidden_size, 1,), nn.ReLU(inplace=True),
+        )
+        self.visual_attention.apply(simple_conv_and_linear_weights_init)
+        visual_encoder.apply(simple_conv_and_linear_weights_init)
+
+        return visual_encoder
+
+    def forward(  # type:ignore
+        self,
+        observations: ObservationType,
+        memory: Memory,
+        prev_actions: torch.Tensor,
+        masks: torch.FloatTensor,
+    ) -> Tuple[ActorCriticOutput[DistributionType], Optional[Memory]]:
+        cur_img_resnet = observations[self.rgb_uuid]
+        unshuffled_img_resnet = observations[self.unshuffled_rgb_uuid]
+        concat_img = torch.cat(
+            (
+                cur_img_resnet,
+                unshuffled_img_resnet,
+                cur_img_resnet * unshuffled_img_resnet,
+            ),
+            dim=-3,
+        )
+        batch_shape, features_shape = concat_img.shape[:-3], concat_img.shape[-3:]
+        concat_img_reshaped = concat_img.view(-1, *features_shape)
+        attention_probs = torch.softmax(
+            self.visual_attention(concat_img_reshaped).view(
+                concat_img_reshaped.shape[0], -1
+            ),
+            dim=-1,
+        ).view(concat_img_reshaped.shape[0], 1, *concat_img_reshaped.shape[-2:])
+        x = (
+            (self.visual_encoder(concat_img_reshaped) * attention_probs)
+            .mean(-1)
+            .mean(-1)
+        )
+        x = x.view(*batch_shape, -1)
+
+        x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
+
+        expert_rays = observations["nerf"]["expert_rays"]
+        expert_classes = observations["nerf"]["expert_classes"]
+        expert_instances = observations["nerf"]["expert_instances"]
+
+        x = x.view(np.prod(batch_shape), 1, self._hidden_size)
+        
+        expert_rays = expert_rays.float().view(
+            np.prod(batch_shape), expert_rays.shape[-1] // 5, 5)
+        expert_classes = expert_classes.view(
+            np.prod(batch_shape), expert_classes.shape[-1])
+        expert_instances = expert_instances.view(
+            np.prod(batch_shape), expert_instances.shape[-1])
+        
+        src_key_padding_mask = expert_classes == 0
+
+        expert_rays = self.pos_encoding(expert_rays)
+        expert_classes = self.class_embedding(expert_classes)
+        expert_instances = self.instance_embedding(expert_instances)
+
+        rays = expert_rays + self.rays_token_embedding.repeat_interleave(expert_rays.shape[1] // 2, dim=1)
+        rgbs = expert_classes + expert_instances + self.rgbs_token_embedding.repeat_interleave(expert_rays.shape[1] // 2, dim=1)
+        
+        rays = self.norm1(rays)
+        rgbs = self.norm2(rgbs)
+
+        x = self.nerf_transformer(
+            x, rays, rgbs, src_key_padding_mask=src_key_padding_mask
+        )
+
+        x = x.view(*batch_shape, self._hidden_size)
 
         ac_output = ActorCriticOutput(
             distributions=self.actor(x), values=self.critic(x), extras={}
