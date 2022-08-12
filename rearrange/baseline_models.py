@@ -486,10 +486,10 @@ class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
             encoder_layer, num_encoder_layers
         )
         
-        self.register_parameter("rays_token_embedding", 
-                                nn.Parameter(torch.randn(1, 2, num_octaves * 2 * 5)))
-        self.register_parameter("rgbs_token_embedding", 
-                                nn.Parameter(torch.randn(1, 2, patch_size)))
+        self.register_parameter("rays_embedding", 
+                                nn.Parameter(torch.randn(2, 1, 1, num_octaves * 2 * 5)))
+        self.register_parameter("rgbs_embedding", 
+                                nn.Parameter(torch.randn(2, 1, 1, patch_size)))
 
     def _create_visual_encoder(self) -> nn.Module:
         a, b = [
@@ -542,36 +542,64 @@ class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
 
         x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
 
-        expert_rays = observations["nerf"]["expert_rays"]
-        expert_classes = observations["nerf"]["expert_classes"]
-        expert_instances = observations["nerf"]["expert_instances"]
+        ######################
+        # BEGIN NERF SECTION #
+        ######################
+
+        walkthrough_rays = observations["nerf"]["walkthrough_rays"]
+        walkthrough_classes = observations["nerf"]["walkthrough_classes"]
+        walkthrough_instances = observations["nerf"]["walkthrough_instances"]
+
+        unshuffle_rays = observations["nerf"]["unshuffle_rays"]
+        unshuffle_classes = observations["nerf"]["unshuffle_classes"]
+        unshuffle_instances = observations["nerf"]["unshuffle_instances"]
 
         x = x.view(np.prod(batch_shape), 1, self._hidden_size)
         
-        expert_rays = expert_rays.float().view(
-            np.prod(batch_shape), expert_rays.shape[-1] // 5, 5)
-        expert_classes = expert_classes.view(
-            np.prod(batch_shape), expert_classes.shape[-1])
-        expert_instances = expert_instances.view(
-            np.prod(batch_shape), expert_instances.shape[-1])
+        walkthrough_rays = walkthrough_rays.float().view(
+            np.prod(batch_shape), walkthrough_rays.shape[-2], 5)
+        walkthrough_classes = walkthrough_classes.view(
+            np.prod(batch_shape), walkthrough_classes.shape[-1])
+        walkthrough_instances = walkthrough_instances.view(
+            np.prod(batch_shape), walkthrough_instances.shape[-1])
         
-        src_key_padding_mask = expert_classes == 0
+        walkthrough_mask = walkthrough_classes == 0
 
-        expert_rays = self.pos_encoding(expert_rays)
-        expert_classes = self.class_embedding(expert_classes)
-        expert_instances = self.instance_embedding(expert_instances)
+        walkthrough_rays = self.pos_encoding(walkthrough_rays)
+        walkthrough_classes = self.class_embedding(walkthrough_classes)
+        walkthrough_instances = self.instance_embedding(walkthrough_instances)
 
-        rays = expert_rays + self.rays_token_embedding.repeat_interleave(expert_rays.shape[1] // 2, dim=1)
-        rgbs = expert_classes + expert_instances + self.rgbs_token_embedding.repeat_interleave(expert_rays.shape[1] // 2, dim=1)
+        walkthrough_rays = walkthrough_rays + self.rays_embedding[0]
+        walkthrough_rgbs = walkthrough_classes + walkthrough_instances + self.rgbs_embedding[0]
         
-        rays = self.norm1(rays)
-        rgbs = self.norm2(rgbs)
+        unshuffle_rays = unshuffle_rays.float().view(
+            np.prod(batch_shape), unshuffle_rays.shape[-2], 5)
+        unshuffle_classes = unshuffle_classes.view(
+            np.prod(batch_shape), unshuffle_classes.shape[-1])
+        unshuffle_instances = unshuffle_instances.view(
+            np.prod(batch_shape), unshuffle_instances.shape[-1])
+        
+        unshuffle_mask = unshuffle_classes == 0
+
+        unshuffle_rays = self.pos_encoding(unshuffle_rays)
+        unshuffle_classes = self.class_embedding(unshuffle_classes)
+        unshuffle_instances = self.instance_embedding(unshuffle_instances)
+
+        unshuffle_rays = unshuffle_rays + self.rays_embedding[1]
+        unshuffle_rgbs = unshuffle_classes + unshuffle_instances + self.rgbs_embedding[1]
+        
+        rays = self.norm1(torch.cat([walkthrough_rays, unshuffle_rays], dim=1))
+        rgbs = self.norm2(torch.cat([walkthrough_rgbs, unshuffle_rgbs], dim=1))
 
         x = self.nerf_transformer(
-            x, rays, rgbs, src_key_padding_mask=src_key_padding_mask
+            x, rays, rgbs, src_key_padding_mask=torch.cat([walkthrough_mask, unshuffle_mask], dim=1)
         )
 
         x = x.view(*batch_shape, self._hidden_size)
+
+        ####################
+        # END NERF SECTION #
+        ####################
 
         ac_output = ActorCriticOutput(
             distributions=self.actor(x), values=self.critic(x), extras={}
