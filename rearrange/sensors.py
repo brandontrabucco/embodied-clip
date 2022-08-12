@@ -97,10 +97,15 @@ class ExpertRaysSensor(
     NUM_PATCHES = 3
     MAX_OBJECTS_SHUFFLED = 8
 
-    EXPERT_RAYS_LABEL = "expert_rays"
+    WALKTHROUGH_RAYS_LABEL = "walkthrough_rays"
 
-    EXPERT_CLASSES_LABEL = "expert_classes"
-    EXPERT_INSTANCES_LABEL = "expert_instances"
+    WALKTHROUGH_CLASSES_LABEL = "walkthrough_classes"
+    WALKTHROUGH_INSTANCES_LABEL = "walkthrough_instances"
+
+    UNSHUFFLE_RAYS_LABEL = "unshuffle_rays"
+
+    UNSHUFFLE_CLASSES_LABEL = "unshuffle_classes"
+    UNSHUFFLE_INSTANCES_LABEL = "unshuffle_instances"
 
     @staticmethod
     def distance_to_object(x, object_i):
@@ -109,21 +114,30 @@ class ExpertRaysSensor(
 
     def __init__(self, uuid="nerf"):
 
-        observation_space = gym.spaces.Dict(
-            [
-                (self.EXPERT_RAYS_LABEL, 
-                 gym.spaces.Box(np.full([2 * self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES * 5], -20.0), 
-                                np.full([2 * self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES * 5],  20.0))),
+        observation_space = gym.spaces.Dict([
 
-                (self.EXPERT_CLASSES_LABEL, 
-                 gym.spaces.MultiDiscrete(np.full([
-                     2 * self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES], len(CLASS_TO_ID)))),
-                                                
-                (self.EXPERT_INSTANCES_LABEL, 
-                 gym.spaces.MultiDiscrete(np.full([
-                     2 * self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES], len(CLASS_TO_ID)))),
-            ]
-        )
+            (self.WALKTHROUGH_RAYS_LABEL, 
+                gym.spaces.Box(np.full([self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES, 5], -20.0), 
+                               np.full([self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES, 5],  20.0))),
+            (self.UNSHUFFLE_RAYS_LABEL, 
+                gym.spaces.Box(np.full([self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES, 5], -20.0), 
+                               np.full([self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES, 5],  20.0))),
+
+            (self.WALKTHROUGH_CLASSES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES], len(CLASS_TO_ID)))),
+            (self.UNSHUFFLE_CLASSES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES], len(CLASS_TO_ID)))),
+                                            
+            (self.WALKTHROUGH_INSTANCES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES], len(CLASS_TO_ID)))),
+            (self.UNSHUFFLE_INSTANCES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES], len(CLASS_TO_ID)))),
+
+        ])
         
         super().__init__(**prepare_locals_for_super(locals()))
 
@@ -221,8 +235,8 @@ class ExpertRaysSensor(
 
             class_counts[object_u["type"]] += 1
             
-        unshuffle_rays = np.concatenate(unshuffle_rays, axis=0)
-        walkthrough_rays = np.concatenate(walkthrough_rays, axis=0)
+        unshuffle_rays = np.stack(unshuffle_rays, axis=0)
+        walkthrough_rays = np.stack(walkthrough_rays, axis=0)
 
         unshuffle_class = np.array(unshuffle_class)
         walkthrough_class = np.array(walkthrough_class)
@@ -230,23 +244,30 @@ class ExpertRaysSensor(
         unshuffle_instance = np.array(unshuffle_instance)
         walkthrough_instance = np.array(walkthrough_instance)
 
-        add_padding = 2 * self.MAX_OBJECTS_SHUFFLED * self.NUM_PATCHES - 2 * unshuffle_class.size
+        add_padding = (self.MAX_OBJECTS_SHUFFLED * 
+                       self.NUM_PATCHES - unshuffle_class.size)
 
         return OrderedDict([  # return rays and discrete labels
 
-            (self.EXPERT_RAYS_LABEL, np.concatenate([
-                unshuffle_rays, 
+            (self.WALKTHROUGH_RAYS_LABEL, np.concatenate([
                 walkthrough_rays,
-                np.full([add_padding * 5], 0.0)], axis=0)),
+                np.full([add_padding, 5], 0.0)], axis=0)),
+            (self.UNSHUFFLE_RAYS_LABEL, np.concatenate([
+                unshuffle_rays, 
+                np.full([add_padding, 5], 0.0)], axis=0)),
 
-            (self.EXPERT_CLASSES_LABEL, np.concatenate([
-                unshuffle_class, 
+            (self.WALKTHROUGH_CLASSES_LABEL, np.concatenate([
                 walkthrough_class,
                 np.full([add_padding], 0)], axis=0)),
+            (self.UNSHUFFLE_CLASSES_LABEL, np.concatenate([
+                unshuffle_class, 
+                np.full([add_padding], 0)], axis=0)),
 
-            (self.EXPERT_INSTANCES_LABEL, np.concatenate([
-                unshuffle_instance, 
+            (self.WALKTHROUGH_INSTANCES_LABEL, np.concatenate([
                 walkthrough_instance,
+                np.full([add_padding], 0)], axis=0)),
+            (self.UNSHUFFLE_INSTANCES_LABEL, np.concatenate([
+                unshuffle_instance, 
                 np.full([add_padding], 0)], axis=0))])
 
                 
