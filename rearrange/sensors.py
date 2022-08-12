@@ -171,19 +171,19 @@ class ExpertRaysSensor(
                 position = pui
                 position["y"] = 1.275
 
-                start = np.array([object_u["position"]["x"], 
-                                  object_u["position"]["y"], 
-                                  object_u["position"]["z"]])
+                end = np.array([object_u["position"]["x"], 
+                                object_u["position"]["y"], 
+                                object_u["position"]["z"]])
 
-                end = np.array([position["x"], 
-                                position["y"], 
-                                position["z"]])
+                start = np.array([position["x"], 
+                                  position["y"], 
+                                  position["z"]])
 
                 look_at = end - start
                 look_at = look_at / np.linalg.norm(look_at)
 
-                rx = -np.arccos(look_at[1])
-                ry =  np.arctan2(look_at[0], look_at[2])
+                rx = np.arccos(look_at[1]) - np.pi/2
+                ry = np.arctan2(look_at[0], look_at[2])
                 
                 pose_u = np.array([position["x"], 
                                    position["y"], 
@@ -192,18 +192,18 @@ class ExpertRaysSensor(
                 position = pwi
                 position["y"] = 1.275
 
-                start = np.array([object_w["position"]["x"], 
-                                  object_w["position"]["y"], 
-                                  object_w["position"]["z"]])
+                end = np.array([object_w["position"]["x"], 
+                                object_w["position"]["y"], 
+                                object_w["position"]["z"]])
 
-                end = np.array([position["x"], 
-                                position["y"], 
-                                position["z"]])
+                start = np.array([position["x"], 
+                                  position["y"], 
+                                  position["z"]])
 
                 look_at = end - start
                 look_at = look_at / np.linalg.norm(look_at)
 
-                rx = -np.arccos(look_at[1])
+                rx = np.arccos(look_at[1]) - np.pi/2
                 ry =  np.arctan2(look_at[0], look_at[2])
                 
                 pose_w = np.array([position["x"], 
