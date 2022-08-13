@@ -452,7 +452,7 @@ class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
         patch_size = 768
         num_octaves = 8
         start_octave = -5
-        num_encoder_layers = 6
+        num_encoder_layers = 3
         dim_head = 64
         nhead = hidden_size // dim_head
         dropout = 0.1
@@ -482,7 +482,11 @@ class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
             src2_dim=patch_size
         )
         
-        self.nerf_transformer = TransformerEncoder(
+        self.transformer1 = TransformerEncoder(
+            encoder_layer, num_encoder_layers
+        )
+        
+        self.transformer2 = TransformerEncoder(
             encoder_layer, num_encoder_layers
         )
         
@@ -540,11 +544,9 @@ class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
         )
         x = x.view(*batch_shape, -1)
 
-        x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
-
-        ######################
-        # BEGIN NERF SECTION #
-        ######################
+        ############################
+        # BEGIN NERF PREPROCESSING #
+        ############################
 
         walkthrough_rays = observations["nerf"]["walkthrough_rays"]
         walkthrough_classes = observations["nerf"]["walkthrough_classes"]
@@ -553,8 +555,6 @@ class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
         unshuffle_rays = observations["nerf"]["unshuffle_rays"]
         unshuffle_classes = observations["nerf"]["unshuffle_classes"]
         unshuffle_instances = observations["nerf"]["unshuffle_instances"]
-
-        x = x.view(np.prod(batch_shape), 1, self._hidden_size)
         
         walkthrough_rays = walkthrough_rays.float().view(
             np.prod(batch_shape), walkthrough_rays.shape[-2], 5)
@@ -590,11 +590,28 @@ class ResNetRearrangeActorCriticNeRFRNN(RearrangeActorCriticSimpleConvRNN):
         
         rays = self.norm1(torch.cat([walkthrough_rays, unshuffle_rays], dim=1))
         rgbs = self.norm2(torch.cat([walkthrough_rgbs, unshuffle_rgbs], dim=1))
+        nerf_mask = torch.cat([walkthrough_mask, unshuffle_mask], dim=1)
 
-        x = self.nerf_transformer(
-            x, rays, rgbs, src_key_padding_mask=torch.cat([walkthrough_mask, unshuffle_mask], dim=1)
-        )
+        ######################
+        # BEGIN NERF SECTION #
+        ######################
 
+        x = x.view(np.prod(batch_shape), 1, self._hidden_size)
+        x = self.transformer1(x, rays, rgbs, src_key_padding_mask=nerf_mask)
+        x = x.view(*batch_shape, self._hidden_size)
+
+        ####################
+        # END NERF SECTION #
+        ####################
+
+        x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
+
+        ######################
+        # BEGIN NERF SECTION #
+        ######################
+
+        x = x.view(np.prod(batch_shape), 1, self._hidden_size)
+        x = self.transformer2(x, rays, rgbs, src_key_padding_mask=nerf_mask)
         x = x.view(*batch_shape, self._hidden_size)
 
         ####################
