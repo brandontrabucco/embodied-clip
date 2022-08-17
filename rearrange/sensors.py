@@ -90,6 +90,142 @@ CLASS_TO_COLOR = OrderedDict(
 CLASS_TO_ID = OrderedDict([(key, idx) for idx, key in enumerate(CLASS_TO_COLOR.keys())])
 
 
+class ExpertObjectsSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
+
+    MAX_OBJECTS_SHUFFLED = 8
+
+    WALKTHROUGH_OBJECTS_LABEL = "walkthrough_rays"
+    WALKTHROUGH_CLASSES_LABEL = "walkthrough_classes"
+    WALKTHROUGH_INSTANCES_LABEL = "walkthrough_instances"
+
+    UNSHUFFLE_OBJECTS_LABEL = "unshuffle_rays"
+    UNSHUFFLE_CLASSES_LABEL = "unshuffle_classes"
+    UNSHUFFLE_INSTANCES_LABEL = "unshuffle_instances"
+
+    def __init__(self, uuid="nerf", use_egocentric_sensor=True):
+
+        self.use_egocentric_sensor = use_egocentric_sensor
+
+        observation_space = gym.spaces.Dict([
+
+            (self.WALKTHROUGH_OBJECTS_LABEL, 
+                gym.spaces.Box(np.full([self.MAX_OBJECTS_SHUFFLED, 3], -20.0), 
+                               np.full([self.MAX_OBJECTS_SHUFFLED, 3],  20.0))),
+            (self.UNSHUFFLE_OBJECTS_LABEL, 
+                gym.spaces.Box(np.full([self.MAX_OBJECTS_SHUFFLED, 3], -20.0), 
+                               np.full([self.MAX_OBJECTS_SHUFFLED, 3],  20.0))),
+
+            (self.WALKTHROUGH_CLASSES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED], len(CLASS_TO_ID)))),
+            (self.UNSHUFFLE_CLASSES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED], len(CLASS_TO_ID)))),
+                                            
+            (self.WALKTHROUGH_INSTANCES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED], len(CLASS_TO_ID)))),
+            (self.UNSHUFFLE_INSTANCES_LABEL, 
+                gym.spaces.MultiDiscrete(np.full([
+                    self.MAX_OBJECTS_SHUFFLED], len(CLASS_TO_ID)))),
+
+        ])
+        
+        super().__init__(**prepare_locals_for_super(locals()))
+
+    def get_observation(self, env, task) -> Any:
+
+        if not isinstance(task, UnshuffleTask):
+            raise NotImplementedError(
+                f"Unknown task type {type(task)}, must be an `UnshuffleTask`."
+            )
+
+        location = task.env.get_agent_location()
+        crouch_height_offset = 0.675 if location["standing"] else 0.0
+
+        agent_current_pose = np.array([location["x"], location["y"] + 
+                                       crouch_height_offset, location["z"]])
+
+        reachable_positions = task.env.controller.step(
+            action="GetReachablePositions").metadata["actionReturn"]
+
+        unshuffle_objects = []
+        walkthrough_objects = []
+
+        unshuffle_classes = []
+        walkthrough_classes = []
+
+        unshuffle_instances = []
+        walkthrough_instances = []
+
+        class_counts = defaultdict(int)
+
+        unshuffle_poses, walkthrough_poses, _ = task.env.poses
+        for object_u, object_w in zip(unshuffle_poses, walkthrough_poses):
+
+            if task.env.are_poses_equal(object_u, object_w):
+                continue  # only compute positions for misplaced objects 
+
+            pose_u = np.array([object_u["position"]["x"], 
+                               object_u["position"]["y"], 
+                               object_u["position"]["z"]])
+
+            if self.use_egocentric_sensor:
+                pose_u = pose_u - agent_current_pose
+
+            pose_w = np.array([object_w["position"]["x"], 
+                               object_w["position"]["y"], 
+                               object_w["position"]["z"]])
+
+            if self.use_egocentric_sensor:
+                pose_w = pose_w - agent_current_pose
+
+            unshuffle_objects.append(pose_u)
+            walkthrough_objects.append(pose_w)
+
+            unshuffle_classes.append(CLASS_TO_ID[object_u["type"]])
+            walkthrough_classes.append(CLASS_TO_ID[object_w["type"]])
+
+            unshuffle_instances.append(class_counts[object_u["type"]])
+            walkthrough_instances.append(class_counts[object_w["type"]])
+
+            class_counts[object_u["type"]] += 1
+            
+        unshuffle_objects = np.stack(unshuffle_objects, axis=0)
+        walkthrough_objects = np.stack(walkthrough_objects, axis=0)
+
+        unshuffle_classes = np.array(unshuffle_classes)
+        walkthrough_classes = np.array(walkthrough_classes)
+
+        unshuffle_instances = np.array(unshuffle_instances)
+        walkthrough_instances = np.array(walkthrough_instances)
+
+        add_padding = self.MAX_OBJECTS_SHUFFLED - unshuffle_classes.size
+
+        return OrderedDict([  # return rays and discrete labels
+
+            (self.WALKTHROUGH_OBJECTS_LABEL, np.concatenate([
+                walkthrough_objects,
+                np.full([add_padding, 3], 0.0)], axis=0)),
+            (self.UNSHUFFLE_OBJECTS_LABEL, np.concatenate([
+                unshuffle_objects, 
+                np.full([add_padding, 3], 0.0)], axis=0)),
+
+            (self.WALKTHROUGH_CLASSES_LABEL, np.concatenate([
+                walkthrough_classes,
+                np.full([add_padding], 0)], axis=0)),
+            (self.UNSHUFFLE_CLASSES_LABEL, np.concatenate([
+                unshuffle_classes, 
+                np.full([add_padding], 0)], axis=0)),
+
+            (self.WALKTHROUGH_INSTANCES_LABEL, np.concatenate([
+                walkthrough_instances,
+                np.full([add_padding], 0)], axis=0)),
+            (self.UNSHUFFLE_INSTANCES_LABEL, np.concatenate([
+                unshuffle_instances, 
+                np.full([add_padding], 0)], axis=0))])
+
+
 class ExpertRaysSensor(
     Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]
 ):
@@ -112,7 +248,9 @@ class ExpertRaysSensor(
         return np.sqrt((x["x"] - object_i["position"]["x"]) ** 2 + 
                        (x["z"] - object_i["position"]["z"]) ** 2)
 
-    def __init__(self, uuid="nerf"):
+    def __init__(self, uuid="nerf", use_egocentric_sensor=False):
+
+        self.use_egocentric_sensor = use_egocentric_sensor
 
         observation_space = gym.spaces.Dict([
 
@@ -147,6 +285,13 @@ class ExpertRaysSensor(
             raise NotImplementedError(
                 f"Unknown task type {type(task)}, must be an `UnshuffleTask`."
             )
+
+        location = task.env.get_agent_location()
+        crouch_height_offset = 0.675 if location["standing"] else 0.0
+
+        agent_current_pose = np.array([
+            location["x"], location["y"] + crouch_height_offset, location["z"],
+            location["horizon"] / 180.0 * np.pi, location["rotation"] / 180.0 * np.pi])
 
         reachable_positions = task.env.controller.step(
             action="GetReachablePositions").metadata["actionReturn"]
@@ -203,6 +348,9 @@ class ExpertRaysSensor(
                                    position["y"], 
                                    position["z"], rx, ry])
 
+                if self.use_egocentric_sensor:
+                    pose_u = pose_u - agent_current_pose
+
                 position = pwi
                 position["y"] = 1.275
 
@@ -223,6 +371,11 @@ class ExpertRaysSensor(
                 pose_w = np.array([position["x"], 
                                    position["y"], 
                                    position["z"], rx, ry])
+
+                if self.use_egocentric_sensor:
+                    pose_w = pose_w - agent_current_pose
+
+                    print(pose_w[3:])
 
                 unshuffle_rays.append(pose_u)
                 walkthrough_rays.append(pose_w)
