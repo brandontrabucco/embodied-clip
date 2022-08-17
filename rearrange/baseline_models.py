@@ -46,6 +46,8 @@ from allenact.embodiedai.models.basic_models import SimpleCNN, RNNStateEncoder
 from allenact.utils.misc_utils import prepare_locals_for_super
 from allenact.utils.model_utils import simple_conv_and_linear_weights_init
 
+from .attention_models import TransformerXL
+
 
 class RearrangeActorCriticSimpleConvRNN(ActorCriticModel[CategoricalDistr]):
     """A CNN->RNN actor-critic model for rearrangement tasks."""
@@ -236,6 +238,212 @@ class ResNetRearrangeActorCriticRNN(RearrangeActorCriticSimpleConvRNN):
         )
 
         return ac_output, memory.set_tensor("rnn", rnn_hidden_states)
+
+
+class RearrangeActorCriticSimpleConvTransformer(ActorCriticModel[CategoricalDistr]):
+    """A CNN->RNN actor-critic model for rearrangement tasks."""
+
+    def __init__(
+        self,
+        action_space: gym.spaces.Discrete,
+        observation_space: gym.spaces.Dict,
+        rgb_uuid: str,
+        unshuffled_rgb_uuid: str,
+        
+        hidden_size: int = 768, 
+        depth: int = 6, 
+        heads: int = 12, 
+        dim_head: int = 64, 
+        mlp_dim: int = 1536, 
+        dropout: float = 0.
+    ):
+        """Initialize a `RearrangeActorCriticSimpleConvTransformer` object.
+
+        # Parameters
+        action_space : The action space of the agent.
+            Should equal `gym.spaces.Discrete(# actions available to the agent)`.
+        observation_space : The observation space available to the agent.
+        rgb_uuid : The unique id of the RGB image sensor (see `RGBSensor`).
+        unshuffled_rgb_uuid : The unique id of the `UnshuffledRGBRearrangeSensor` available to the agent.
+        """
+        super().__init__(action_space=action_space, observation_space=observation_space)
+        self._hidden_size = hidden_size
+        self._depth = depth
+
+        self.rgb_uuid = rgb_uuid
+        self.unshuffled_rgb_uuid = unshuffled_rgb_uuid
+
+        self.concat_rgb_uuid = "concat_rgb"
+        assert self.concat_rgb_uuid not in observation_space
+
+        self.visual_encoder = self._create_visual_encoder()
+
+        self.state_encoder = TransformerXL(
+            hidden_size, depth, heads, dim_head, mlp_dim, dropout=dropout
+        )
+
+        self.actor = LinearActorHead(self._hidden_size, action_space.n)
+        self.critic = LinearCriticHead(self._hidden_size)
+
+        self.train()
+
+    def _create_visual_encoder(self) -> nn.Module:
+        """Create the visual encoder for the model."""
+        img_space: gym.spaces.Box = self.observation_space[self.rgb_uuid]
+        return SimpleCNN(
+            observation_space=gym.spaces.Dict(
+                {
+                    self.concat_rgb_uuid: gym.spaces.Box(
+                        low=np.tile(img_space.low, (1, 1, 2)),
+                        high=np.tile(img_space.high, (1, 1, 2)),
+                        shape=img_space.shape[:2] + (img_space.shape[2] * 2,),
+                    )
+                }
+            ),
+            output_size=self._hidden_size,
+            rgb_uuid=self.concat_rgb_uuid,
+            depth_uuid=None,
+        )
+
+    def _recurrent_memory_specification(self):
+        return dict(
+            transformer=(
+                (
+                    ("sampler", None),
+                    ("hidden", 64 * self._depth * self._hidden_size),
+                ),
+                torch.float32,
+            )
+        )
+
+    def forward(  # type:ignore
+        self,
+        observations: ObservationType,
+        memory: Memory,
+        prev_actions: torch.Tensor,
+        masks: torch.FloatTensor,
+    ) -> Tuple[ActorCriticOutput[DistributionType], Optional[Memory]]:
+        cur_img = observations[self.rgb_uuid]
+        unshuffled_img = observations[self.unshuffled_rgb_uuid]
+        concat_img = torch.cat((cur_img, unshuffled_img), dim=-1)
+
+        x = self.visual_encoder({self.concat_rgb_uuid: concat_img})
+
+        autoregressive_mask = nn.Transformer.generate_square_subsequent_mask(x.shape[0])
+        autoregressive_mask = autoregressive_mask.to(x.device).float() * -999999
+
+        x, h = self.state_encoder(x, memory.tensor("transformer"), 
+                                  attn_bias=autoregressive_mask)
+        x = x * masks
+
+        ac_output = ActorCriticOutput(
+            distributions=self.actor(x), values=self.critic(x), extras={}
+        )
+
+        return ac_output, memory.set_tensor("transformer", h)
+
+
+class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransformer):
+    def __init__(
+        self,
+        action_space: gym.spaces.Discrete,
+        observation_space: gym.spaces.Dict,
+        rgb_uuid: str,
+        unshuffled_rgb_uuid: str,
+        
+        hidden_size: int = 768, 
+        depth: int = 6, 
+        heads: int = 12, 
+        dim_head: int = 64, 
+        mlp_dim: int = 1536, 
+        dropout: float = 0.
+    ):
+        """A CNN->RNN rearrangement model that expects ResNet features instead
+        of RGB images.
+
+        Nearly identical to `RearrangeActorCriticSimpleConvRNN` but
+        `rgb_uuid` should now be the unique id of the ResNetPreprocessor
+        used to featurize RGB images using a pretrained ResNet before
+        they're passed to this model.
+        """
+        self.visual_attention: Optional[nn.Module] = None
+        super().__init__(**prepare_locals_for_super(locals()))
+
+    def _create_visual_encoder(self) -> nn.Module:
+        a, b = [
+            self.observation_space[k].shape[0]
+            for k in [self.rgb_uuid, self.unshuffled_rgb_uuid]
+        ]
+        assert a == b
+        self.visual_attention = nn.Sequential(
+            nn.Conv2d(3 * a, 32, 1,), nn.ReLU(inplace=True), nn.Conv2d(32, 1, 1,),
+        )
+        visual_encoder = nn.Sequential(
+            nn.Conv2d(3 * a, self._hidden_size, 1,), nn.ReLU(inplace=True),
+        )
+        self.visual_attention.apply(simple_conv_and_linear_weights_init)
+        visual_encoder.apply(simple_conv_and_linear_weights_init)
+
+        return visual_encoder
+
+    def forward(  # type:ignore
+        self,
+        observations: ObservationType,
+        memory: Memory,
+        prev_actions: torch.Tensor,
+        masks: torch.FloatTensor,
+    ) -> Tuple[ActorCriticOutput[DistributionType], Optional[Memory]]:
+        cur_img_resnet = observations[self.rgb_uuid]
+        unshuffled_img_resnet = observations[self.unshuffled_rgb_uuid]
+        concat_img = torch.cat(
+            (
+                cur_img_resnet,
+                unshuffled_img_resnet,
+                cur_img_resnet * unshuffled_img_resnet,
+            ),
+            dim=-3,
+        )
+        batch_shape, features_shape = concat_img.shape[:-3], concat_img.shape[-3:]
+        concat_img_reshaped = concat_img.view(-1, *features_shape)
+        attention_probs = torch.softmax(
+            self.visual_attention(concat_img_reshaped).view(
+                concat_img_reshaped.shape[0], -1
+            ),
+            dim=-1,
+        ).view(concat_img_reshaped.shape[0], 1, *concat_img_reshaped.shape[-2:])
+        x = (
+            (self.visual_encoder(concat_img_reshaped) * attention_probs)
+            .mean(-1)
+            .mean(-1)
+        )
+        x = x.view(*batch_shape, -1)
+
+        sequence_len, batch_size = batch_shape
+
+        h = memory.tensor("transformer").view(
+            batch_size, 64, self._depth, self._hidden_size)
+
+        x = x.transpose(0, 1)
+
+        memory_mask = (h == 0).all(-1).all(-1)
+        memory_mask = memory_mask.view(batch_size, 1, 64)
+        memory_mask = memory_mask.expand(batch_size, sequence_len, 64)
+
+        memory_mask = torch.where(memory_mask, -float('inf'), 0.0)
+        memory_mask = F.pad(memory_mask, (0, sequence_len))
+
+        x, new_h = self.state_encoder(x, h, attn_bias=memory_mask)
+
+        h = torch.cat([h[:, sequence_len:], new_h], dim=1)
+        h = h.view(batch_size, 64 * self._depth * self._hidden_size)
+
+        x = x.transpose(0, 1) * masks
+
+        ac_output = ActorCriticOutput(
+            distributions=self.actor(x), values=self.critic(x), extras={}
+        )
+
+        return ac_output, memory.set_tensor("transformer", h)
 
 
 class PositionalEncoding(nn.Module):
