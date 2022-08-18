@@ -315,17 +315,17 @@ class RearrangeActorCriticSimpleConvTransformer(ActorCriticModel[CategoricalDist
     def _recurrent_memory_specification(self):
 
         transformer_memory = {
-            "transformer_layer{}".format(i): (
+            "layer{}".format(i): (
                 (
                     ("sampler", None),
                     ("hidden", (self._context_length - 1) * self._hidden_size),
                 ),
                 torch.float32,
-            ) for i in range(self.num_transformer_layers)
+            ) for i in range(self._num_transformer_layers)
         }
 
         memory_mask = {
-            "transformer_mask": (
+            "mask": (
                 (
                     ("sampler", None),
                     ("hidden", (self._context_length - 1)),
@@ -349,12 +349,26 @@ class RearrangeActorCriticSimpleConvTransformer(ActorCriticModel[CategoricalDist
 
         x = self.visual_encoder({self.concat_rgb_uuid: concat_img})
 
-        autoregressive_mask = nn.Transformer.generate_square_subsequent_mask(x.shape[0])
-        autoregressive_mask = autoregressive_mask.to(x.device).float() * -999999
+        sequence_len, batch_size = x.shape[:2]
 
-        x, h = self.state_encoder(x, memory.tensor("transformer"), 
-                                  attn_bias=autoregressive_mask)
-        x = x * masks
+        x = x.transpose(0, 1)
+        masks = masks.transpose(0, 1)
+
+        transformer_mask = F.pad(memory.tensor("mask"), (0, sequence_len), value=1)
+        memory_mask = torch.where(transformer_mask == 0, float('-inf'), 0)
+
+        hidden_states = list(range(self._num_transformer_layers))
+        hidden_states = map(lambda i: memory.tensor("layer{}".format(i)).view(
+            batch_size, self._context_length - 1, self._hidden_size), hidden_states)
+
+        x, *new_hidden_states = self.state_encoder(x, *hidden_states, mask=memory_mask)
+
+        memory = memory.set_tensor("mask", transformer_mask[:, -(self._context_length - 1):] * masks[:, -1])
+        for i, (state_i, new_state_i) in enumerate(zip(hidden_states, new_hidden_states)):
+            update = self.update_memory(state_i, new_state_i, sequence_len)
+            memory = memory.set_tensor("layer{}".format(i), update)
+
+        x = (x * masks).transpose(0, 1)
 
         ac_output = ActorCriticOutput(
             distributions=self.actor(x), values=self.critic(x), extras={}
@@ -406,6 +420,10 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
 
         return visual_encoder
 
+    def update_memory(self, a, b, sequence_len):
+        update_dim = min(sequence_len, self._context_length - 1)
+        return torch.cat((a[:,  update_dim:], b[:, -update_dim:]), dim=1).flatten(start_dim=1)
+
     def forward(  # type:ignore
         self,
         observations: ObservationType,
@@ -440,32 +458,26 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
 
         sequence_len, batch_size = batch_shape
 
-        h = [
-            memory.tensor("transformer_layer{}".format(i)).view(batch_size, self._context_length - 1, self._hidden_size)
-            for i in range(self._num_transformer_layers)
-        ]
-
         x = x.transpose(0, 1)
+        masks = masks.transpose(0, 1)
 
-        transformer_mask = memory.tensor("transformer_mask")
-        print(transformer_mask)
+        transformer_mask = F.pad(memory.tensor("mask"), (0, sequence_len), value=1)
 
-        memory_mask = transformer_mask.view(batch_size, 1, self._context_length - 1)
-        memory_mask = memory_mask.expand(batch_size, sequence_len, self._context_length - 1)
+        hidden_states = list(range(self._num_transformer_layers))
+        hidden_states = map(lambda i: memory.tensor("layer{}".format(i)).view(
+            batch_size, self._context_length - 1, self._hidden_size), hidden_states)
 
-        memory_mask = torch.where(memory_mask == 0, -float('inf'), 0.0)
-        memory_mask = F.pad(memory_mask, (0, sequence_len))
+        memory_mask = torch.where(transformer_mask == 0, float('-inf'), 0)
+        x, *new_hidden_states = self.state_encoder(x, *hidden_states, mask=memory_mask)
 
-        x, *new_h = self.state_encoder(x, *h, mask=memory_mask)
+        transformer_mask = transformer_mask[:, -(self._context_length - 1):] * masks[:, -1]
+        memory = memory.set_tensor("mask", transformer_mask)
 
-        for i in range(self._num_transformer_layers):
-            hi = torch.cat([h[i][:, sequence_len:], new_h[i]], dim=1).view(batch_size, (self._context_length - 1) * self._hidden_size)
-            memory = memory.set_tensor("transformer_layer{}".format(i), hi)
+        for i, (state_i, new_state_i) in enumerate(zip(hidden_states, new_hidden_states)):
+            update = self.update_memory(state_i, new_state_i, sequence_len)
+            memory = memory.set_tensor("layer{}".format(i), update)
 
-        transformer_mask = torch.cat([transformer_mask[:, sequence_len:], torch.ones_like(transformer_mask[:, :sequence_len])], dim=1)
-        memory = memory.set_tensor("transformer_mask", transformer_mask)
-
-        x = x.transpose(0, 1) * masks
+        x = (x * masks).transpose(0, 1)
 
         ac_output = ActorCriticOutput(
             distributions=self.actor(x), values=self.critic(x), extras={}

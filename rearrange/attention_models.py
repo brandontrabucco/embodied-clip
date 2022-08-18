@@ -105,12 +105,12 @@ class Attention(nn.Module):
         
         qkv = self.to_qkv(torch.cat([memory, x], dim = 1)).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.nhead), qkv)
-
-        kr = rearrange(self.to_rel(self.R_embedding)[shifts], 
-                       'n m (h d) -> h n m d', h = self.nhead)
         
         q = q[:, :, memory_dim:]
         k_transpose = k.transpose(-1, -2)
+
+        kr = rearrange(self.to_rel(self.R_embedding)[shifts], 
+                       'n m (h d) -> h n m d', h = self.nhead)
 
         term_a = torch.matmul(q, k_transpose)
         term_b = torch.einsum("bhnd,hnmd->bhnm", q, kr)
@@ -121,7 +121,7 @@ class Attention(nn.Module):
         dots = dots + attention_bias.to(x.device)
 
         if mask is not None:
-            dots = dots + mask.unsqueeze(1)
+            dots = dots + mask.unsqueeze(1).unsqueeze(1)
         
         result = torch.matmul(self.attend(dots), v)
         return self.to_out(rearrange(result, 'b h n d -> b n (h d)'))
