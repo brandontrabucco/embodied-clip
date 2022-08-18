@@ -86,8 +86,8 @@ class Attention(nn.Module):
         term_c = torch.matmul(self.u_embedding.expand(q.shape), k_transpose)
         term_d = torch.einsum("bhnd,hnmd->bhnm", self.v_embedding.expand(q.shape), kr)
 
-        dots = (term_a + term_b + term_c + term_d) * self.scale
-        dots = dots + attention_bias.to(x.device)
+        dots = term_a + term_b + term_c + term_d
+        dots = dots * self.scale + attention_bias.to(x.device)
 
         if mask is not None:
             dots = dots + mask.unsqueeze(1)
@@ -106,6 +106,7 @@ class ResidualPreNorm(nn.Module):
 
     def forward(self, x, *args, **kwargs):
         
+        args = [self.norm(mem) for mem in args]
         return x + self.module(self.norm(x), *args, **kwargs)
 
 
@@ -147,9 +148,9 @@ class TransformerXL(nn.Module):
 
         new_hidden_states = []
 
-        for state, (attention, net) in zip(hidden_states, self.layers):
-
+        for state, (attn, net) in zip(hidden_states, self.layers):
+            
             new_hidden_states.append(x)
-            x = net(attention(x, state, mask = mask))
+            x = net(attn(x, state, mask = mask))
 
         return x, *new_hidden_states
