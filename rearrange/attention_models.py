@@ -1,92 +1,115 @@
 import torch
-from torch import nn
+import numpy as np
 
+from torch import nn
 from einops import rearrange
-from einops.layers.torch import Rearrange
 
 
 class PreNorm(nn.Module):
 
     def __init__(self, dim, fn):
+
         super().__init__()
+
         self.norm = nn.LayerNorm(dim)
         self.fn = fn
 
-    def forward(self, x, **kwargs):
-        return self.fn(self.norm(x), **kwargs)
+    def forward(self, x, *args, **kwargs):
+        
+        return self.fn(self.norm(x), *args, **kwargs)
 
 
 class FeedForward(nn.Module):
 
-    def __init__(self, dim, hidden_dim, dropout = 0.):
+    def __init__(self, dim, dim_feedforward: int = 1536, dropout = 0.):
+
         super().__init__()
+
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
+            nn.Linear(dim, dim_feedforward),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, dim),
+            nn.Linear(dim_feedforward, dim),
             nn.Dropout(dropout)
         )
 
     def forward(self, x):
+
         return self.net(x)
 
 
 class Attention(nn.Module):
 
-    def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0., max_len=1024):
-        super().__init__()
-        inner_dim = dim_head *  heads
-        project_out = not (heads == 1 and dim_head == dim)
+    def __init__(self, dim: int, nhead: int = 8, dim_head: int = 64, 
+                 dropout: float = 0., context_length: int = 64):
 
-        self.heads = heads
+        super().__init__()
+
+        inner_dim = dim_head *  nhead
+        num_octaves = int(np.ceil(np.log2(context_length))) + 1
+
+        self.nhead = nhead
         self.scale = dim_head ** -0.5
 
-        self.attend = nn.Softmax(dim = -1)
-        self.dropout = nn.Dropout(dropout)
-
         self.to_qkv = nn.Linear(dim, inner_dim * 3, bias = False)
-        self.to_kr = nn.Linear(dim, inner_dim, bias = False)
+        self.to_rel = nn.Linear(2 * num_octaves, inner_dim, bias = False)
 
-        self.R_embedding = nn.Parameter(torch.randn(2 * max_len, dim))
+        self.attend = nn.Sequential(nn.Softmax(dim = -1), nn.Dropout(dropout))
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+
         self.u_embedding = nn.Parameter(torch.randn(1, 1, 1, dim_head))
         self.v_embedding = nn.Parameter(torch.randn(1, 1, 1, dim_head))
 
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, dim),
-            nn.Dropout(dropout)
-        ) if project_out else nn.Identity()
+        self.context_length = context_length
 
-        self.register_buffer('shifts', ((
-            torch.arange(2 * max_len).view(1, 2 * max_len) -
-            torch.arange(2 * max_len).view(2 * max_len, 1)
-        ) % (2 * max_len))[:max_len, :max_len])
+        R_embedding = torch.arange(context_length)
 
-    def get_attention_bias(self, memory_dim, sequence_dim, device):
+        self.register_buffer('R_embedding', Attention.positional_encoding(
+            R_embedding.view(context_length, 1), 1 - num_octaves, num_octaves))
 
-        autoregressive_mask = nn.Transformer.generate_square_subsequent_mask(sequence_dim)
-        memory_mask = nn.Transformer.generate_square_subsequent_mask(memory_dim)
+    def get_shifts(self, memory_dim, sequence_dim):
 
-        autoregressive_mask = autoregressive_mask.to(device)
-        memory_mask = memory_mask.to(device)
+        coords = torch.arange(start = memory_dim + sequence_dim - 1, 
+                              end = -1, step = -1) - (sequence_dim - 1)
 
-        memory_mask = memory_mask.transpose(0, 1)[:sequence_len]
+        shifts = coords.unsqueeze(0) + torch.arange(sequence_dim).unsqueeze(1)
+        out_of_bounds = torch.logical_or(shifts < 0, shifts > self.context_length - 1)
 
-        autoregressive_mask = autoregressive_mask.view(1, 1, sequence_dim, sequence_dim)
-        memory_mask = memory_mask.view(1, 1, sequence_dim, memory_dim)
+        attention_bias = torch.where(out_of_bounds, float('-inf'), 0.0)
+        return shifts.clamp(min = 0, max = self.context_length - 1), attention_bias
+
+    @staticmethod
+    def positional_encoding(coords, start_octave, num_octaves):
+
+        coords_shape = coords.shape
+
+        octaves = torch.arange(start_octave, start_octave + num_octaves)
+        octaves = octaves.float().to(coords.device)
+
+        multipliers = (2 ** octaves) * np.pi
+
+        coords = coords.unsqueeze(-1)
+        while len(multipliers.shape) < len(coords.shape):
+            multipliers = multipliers.unsqueeze(0)
+
+        scaled_coords = (coords * multipliers).view(
+            *coords_shape[:-1], int(coords_shape[-1]) * num_octaves)
+ 
+        return torch.cat((torch.sin(scaled_coords),
+                          torch.cos(scaled_coords)), dim = -1)
+
+    def forward(self, x, memory, mask = None):
+
+        memory_dim, sequence_dim = memory.shape[1], x.shape[1]
+        shifts, attention_bias = self.get_shifts(memory_dim, sequence_dim)
         
-        return torch.cat([memory_mask, autoregressive_mask], dim=3)
+        qkv = self.to_qkv(torch.cat([memory, x], dim = 1)).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.nhead), qkv)
 
-    def forward(self, x, h = None, attn_bias = None):
-        qkv = self.to_qkv(torch.cat([h, x], dim = 1)).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-
-        shifts = self.shifts[h.shape[1]:h.shape[1] + x.shape[1], :h.shape[1] + x.shape[1]]
-
-        kr = self.to_kr(self.R_embedding)[shifts]
-        kr = rearrange(kr, 'n m (h d) -> h n m d', h = self.heads)
+        kr = rearrange(self.to_rel(self.R_embedding)[shifts], 
+                       'n m (h d) -> h n m d', h = self.nhead)
         
-        q = q[:, :, h.shape[1]:]
+        q = q[:, :, memory_dim:]
         k_transpose = k.transpose(-1, -2)
 
         term_a = torch.matmul(q, k_transpose)
@@ -95,35 +118,42 @@ class Attention(nn.Module):
         term_d = torch.einsum("bhnd,hnmd->bhnm", self.v_embedding.expand(q.shape), kr)
 
         dots = (term_a + term_b + term_c + term_d) * self.scale
-        dots = dots + self.get_attention_bias(h.shape[1], x.shape[1], x.device)
+        dots = dots + attention_bias.to(x.device)
 
-        if attn_bias is not None:
-            dots = dots + attn_bias.unsqueeze(1)
+        if mask is not None:
+            dots = dots + mask.unsqueeze(1)
         
-        attn = self.attend(dots)
-        attn = self.dropout(attn)
-
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        return self.to_out(out)
+        result = torch.matmul(self.attend(dots), v)
+        return self.to_out(rearrange(result, 'b h n d -> b n (h d)'))
 
 
 class TransformerXL(nn.Module):
 
-    def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
+    def __init__(self, dim, num_transformer_layers: int = 6, nhead: int = 12, dim_head: int = 64, 
+                 dim_feedforward: int = 1536, context_length: int = 64, dropout: float = 0.):
+
         super().__init__()
+
         self.layers = nn.ModuleList([])
-        for _ in range(depth):
+
+        for _ in range(num_transformer_layers):
+
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(dim, heads = heads, dim_head = dim_head, dropout = dropout)),
-                PreNorm(dim, FeedForward(dim, mlp_dim, dropout = dropout))
+                PreNorm(dim, Attention(
+                    dim, nhead = nhead, dim_head = dim_head, context_length = context_length, dropout = dropout
+                )),
+                PreNorm(dim, FeedForward(
+                    dim, dim_feedforward = dim_feedforward, dropout = dropout
+                ))
             ]))
 
-    def forward(self, x, h, attn_bias = None):
-        new_h = []
-        for i, (attn, ff) in enumerate(self.layers):
-            new_h.append(x)
-            x = attn(x, h = h[:, :, i], attn_bias = attn_bias) + x
-            x = ff(x) + x
-        h = torch.stack(new_h, dim=2)
-        return x, h
+    def forward(self, x, *memory, mask = None):
+
+        new_memory = []
+        for m, (attention, ff) in zip(memory, self.layers):
+            new_memory.append(x)
+
+            x = x + attention(x, m, mask = mask)
+            x = x + ff(x)
+
+        return x, *new_memory

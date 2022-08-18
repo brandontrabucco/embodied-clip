@@ -249,13 +249,13 @@ class RearrangeActorCriticSimpleConvTransformer(ActorCriticModel[CategoricalDist
         observation_space: gym.spaces.Dict,
         rgb_uuid: str,
         unshuffled_rgb_uuid: str,
-        
         hidden_size: int = 768, 
-        depth: int = 6, 
-        heads: int = 12, 
+        num_transformer_layers: int = 6, 
+        nhead: int = 12, 
         dim_head: int = 64, 
-        mlp_dim: int = 1536, 
-        dropout: float = 0.
+        dim_feedforward: int = 1536, 
+        dropout: float = 0.,
+        context_length: int = 64
     ):
         """Initialize a `RearrangeActorCriticSimpleConvTransformer` object.
 
@@ -268,7 +268,8 @@ class RearrangeActorCriticSimpleConvTransformer(ActorCriticModel[CategoricalDist
         """
         super().__init__(action_space=action_space, observation_space=observation_space)
         self._hidden_size = hidden_size
-        self._depth = depth
+        self._num_transformer_layers = num_transformer_layers
+        self._context_length = context_length
 
         self.rgb_uuid = rgb_uuid
         self.unshuffled_rgb_uuid = unshuffled_rgb_uuid
@@ -279,7 +280,13 @@ class RearrangeActorCriticSimpleConvTransformer(ActorCriticModel[CategoricalDist
         self.visual_encoder = self._create_visual_encoder()
 
         self.state_encoder = TransformerXL(
-            hidden_size, depth, heads, dim_head, mlp_dim, dropout=dropout
+            hidden_size, 
+            num_transformer_layers=num_transformer_layers, 
+            nhead=nhead, 
+            dim_head=dim_head, 
+            dim_feedforward=dim_feedforward, 
+            dropout=dropout,
+            context_length=context_length
         )
 
         self.actor = LinearActorHead(self._hidden_size, action_space.n)
@@ -306,15 +313,28 @@ class RearrangeActorCriticSimpleConvTransformer(ActorCriticModel[CategoricalDist
         )
 
     def _recurrent_memory_specification(self):
-        return dict(
-            transformer=(
+
+        transformer_memory = {
+            "transformer_layer{}".format(i): (
                 (
                     ("sampler", None),
-                    ("hidden", 64 * self._depth * self._hidden_size),
+                    ("hidden", (self._context_length - 1) * self._hidden_size),
+                ),
+                torch.float32,
+            ) for i in range(self.num_transformer_layers)
+        }
+
+        memory_mask = {
+            "transformer_mask": (
+                (
+                    ("sampler", None),
+                    ("hidden", (self._context_length - 1)),
                 ),
                 torch.float32,
             )
-        )
+        }
+
+        return {**transformer_memory, **memory_mask}
 
     def forward(  # type:ignore
         self,
@@ -350,13 +370,13 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
         observation_space: gym.spaces.Dict,
         rgb_uuid: str,
         unshuffled_rgb_uuid: str,
-        
         hidden_size: int = 768, 
-        depth: int = 6, 
-        heads: int = 12, 
+        num_transformer_layers: int = 6, 
+        nhead: int = 12, 
         dim_head: int = 64, 
-        mlp_dim: int = 1536, 
-        dropout: float = 0.
+        dim_feedforward: int = 1536, 
+        dropout: float = 0.,
+        context_length: int = 64
     ):
         """A CNN->RNN rearrangement model that expects ResNet features instead
         of RGB images.
@@ -420,22 +440,30 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
 
         sequence_len, batch_size = batch_shape
 
-        h = memory.tensor("transformer").view(
-            batch_size, 64, self._depth, self._hidden_size)
+        h = [
+            memory.tensor("transformer_layer{}".format(i)).view(batch_size, self._context_length - 1, self._hidden_size)
+            for i in range(self._num_transformer_layers)
+        ]
 
         x = x.transpose(0, 1)
 
-        memory_mask = (h == 0).all(-1).all(-1)
-        memory_mask = memory_mask.view(batch_size, 1, 64)
-        memory_mask = memory_mask.expand(batch_size, sequence_len, 64)
+        transformer_mask = memory.tensor("transformer_mask")
+        print(transformer_mask)
 
-        memory_mask = torch.where(memory_mask, -float('inf'), 0.0)
+        memory_mask = transformer_mask.view(batch_size, 1, self._context_length - 1)
+        memory_mask = memory_mask.expand(batch_size, sequence_len, self._context_length - 1)
+
+        memory_mask = torch.where(memory_mask == 0, -float('inf'), 0.0)
         memory_mask = F.pad(memory_mask, (0, sequence_len))
 
-        x, new_h = self.state_encoder(x, h, attn_bias=memory_mask)
+        x, *new_h = self.state_encoder(x, *h, mask=memory_mask)
 
-        h = torch.cat([h[:, sequence_len:], new_h], dim=1)
-        h = h.view(batch_size, 64 * self._depth * self._hidden_size)
+        for i in range(self._num_transformer_layers):
+            hi = torch.cat([h[i][:, sequence_len:], new_h[i]], dim=1).view(batch_size, (self._context_length - 1) * self._hidden_size)
+            memory = memory.set_tensor("transformer_layer{}".format(i), hi)
+
+        transformer_mask = torch.cat([transformer_mask[:, sequence_len:], torch.ones_like(transformer_mask[:, :sequence_len])], dim=1)
+        memory = memory.set_tensor("transformer_mask", transformer_mask)
 
         x = x.transpose(0, 1) * masks
 
@@ -443,7 +471,7 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
             distributions=self.actor(x), values=self.critic(x), extras={}
         )
 
-        return ac_output, memory.set_tensor("transformer", h)
+        return ac_output, memory
 
 
 class PositionalEncoding(nn.Module):

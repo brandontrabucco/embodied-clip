@@ -25,7 +25,7 @@ class OnePhaseRGBTransformerDaggerExperimentConfig(OnePhaseRGBILBaseExperimentCo
         num_mini_batch = 2
         update_repeats = 3
         use_lr_decay = False
-        num_train_processes = 64
+        num_train_processes = 8
         dagger_steps = min(int(1e6), cls.TRAINING_STEPS // 10)
         bc_tf1_steps = min(int(1e5), cls.TRAINING_STEPS // 10)
 
