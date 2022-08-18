@@ -101,9 +101,8 @@ class ResidualPreNorm(nn.Module):
     def __init__(self, dim, module):
 
         super(ResidualPreNorm, self).__init__()
-
-        self.module = module
         self.norm = nn.LayerNorm(dim)
+        self.module = module
 
     def forward(self, x, *args, **kwargs):
         
