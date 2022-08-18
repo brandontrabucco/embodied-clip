@@ -5,45 +5,15 @@ from torch import nn
 from einops import rearrange
 
 
-class PreNorm(nn.Module):
-
-    def __init__(self, dim, fn):
-
-        super().__init__()
-
-        self.norm = nn.LayerNorm(dim)
-        self.fn = fn
-
-    def forward(self, x, *args, **kwargs):
-        
-        return self.fn(self.norm(x), *args, **kwargs)
-
-
-class FeedForward(nn.Module):
-
-    def __init__(self, dim, dim_feedforward: int = 1536, dropout = 0.):
-
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(dim, dim_feedforward),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, dim),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, x):
-
-        return self.net(x)
-
-
 class Attention(nn.Module):
 
-    def __init__(self, dim: int, nhead: int = 8, dim_head: int = 64, 
-                 dropout: float = 0., context_length: int = 64):
+    def __init__(self, dim: int, 
+                 nhead: int = 12, 
+                 dim_head: int = 64, 
+                 context_length: int = 64, 
+                 dropout: float = 0.):
 
-        super().__init__()
+        super(Attention, self).__init__()
 
         inner_dim = dim_head *  nhead
         num_octaves = int(np.ceil(np.log2(context_length))) + 1
@@ -69,10 +39,9 @@ class Attention(nn.Module):
 
     def get_shifts(self, memory_dim, sequence_dim):
 
-        coords = torch.arange(start = memory_dim + sequence_dim - 1, 
-                              end = -1, step = -1) - (sequence_dim - 1)
-
+        coords = torch.arange(memory_dim + sequence_dim - 1, -1, -1) - (sequence_dim - 1)
         shifts = coords.unsqueeze(0) + torch.arange(sequence_dim).unsqueeze(1)
+        
         out_of_bounds = torch.logical_or(shifts < 0, shifts > self.context_length - 1)
 
         attention_bias = torch.where(out_of_bounds, float('-inf'), 0.0)
@@ -109,8 +78,7 @@ class Attention(nn.Module):
         q = q[:, :, memory_dim:]
         k_transpose = k.transpose(-1, -2)
 
-        kr = rearrange(self.to_rel(self.R_embedding)[shifts], 
-                       'n m (h d) -> h n m d', h = self.nhead)
+        kr = rearrange(self.to_rel(self.R_embedding)[shifts], 'n m (h d) -> h n m d', h = self.nhead)
 
         term_a = torch.matmul(q, k_transpose)
         term_b = torch.einsum("bhnd,hnmd->bhnm", q, kr)
@@ -127,33 +95,60 @@ class Attention(nn.Module):
         return self.to_out(rearrange(result, 'b h n d -> b n (h d)'))
 
 
+class ResidualPreNorm(nn.Module):
+
+    def __init__(self, dim, module):
+
+        super(ResidualPreNorm, self).__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.module = module
+
+    def forward(self, x, *args, **kwargs):
+        
+        return x + self.module(self.norm(x), *args, **kwargs)
+
+
 class TransformerXL(nn.Module):
 
-    def __init__(self, dim, num_transformer_layers: int = 6, nhead: int = 12, dim_head: int = 64, 
-                 dim_feedforward: int = 1536, context_length: int = 64, dropout: float = 0.):
+    def __init__(self, dim: int, 
+                 num_transformer_layers: int = 6, 
+                 nhead: int = 12, 
+                 dim_head: int = 64, 
+                 dim_feedforward: int = 1536, 
+                 context_length: int = 64, 
+                 dropout: float = 0.):
 
-        super().__init__()
+        super(TransformerXL, self).__init__()
 
         self.layers = nn.ModuleList([])
 
         for _ in range(num_transformer_layers):
 
+            attention =  Attention(
+                dim = dim, 
+                nhead = nhead, 
+                dim_head = dim_head, 
+                context_length = context_length, 
+                dropout = dropout)
+
+            net = nn.Sequential(
+                nn.Linear(dim, dim_feedforward), 
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_feedforward, dim),
+                nn.Dropout(dropout))
+
             self.layers.append(nn.ModuleList([
-                PreNorm(dim, Attention(
-                    dim, nhead = nhead, dim_head = dim_head, context_length = context_length, dropout = dropout
-                )),
-                PreNorm(dim, FeedForward(
-                    dim, dim_feedforward = dim_feedforward, dropout = dropout
-                ))
-            ]))
+                ResidualPreNorm(dim, attention),
+                ResidualPreNorm(dim, net)]))
 
-    def forward(self, x, *memory, mask = None):
+    def forward(self, x, *hidden_states, mask = None):
 
-        new_memory = []
-        for m, (attention, ff) in zip(memory, self.layers):
-            new_memory.append(x)
+        new_hidden_states = []
 
-            x = x + attention(x, m, mask = mask)
-            x = x + ff(x)
+        for state, (attention, net) in zip(hidden_states, self.layers):
 
-        return x, *new_memory
+            new_hidden_states.append(x)
+            x = net(attention(x, state, mask = mask))
+
+        return x, *new_hidden_states
