@@ -420,10 +420,6 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
 
         return visual_encoder
 
-    def update_memory(self, a, b, sequence_len):
-        update_dim = min(sequence_len, self._context_length - 1)
-        return torch.cat((a[:,  update_dim:], b[:, -update_dim:]), dim=1).flatten(start_dim=1)
-
     def forward(  # type:ignore
         self,
         observations: ObservationType,
@@ -461,7 +457,16 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
         x = x.transpose(0, 1)
         masks = masks.transpose(0, 1)
 
-        transformer_mask = F.pad(memory.tensor("mask"), (0, sequence_len), value=1)
+        transformer_mask = memory.tensor("mask").unsqueeze(1)
+        transformer_mask = F.pad(transformer_mask, (0, sequence_len), value=1)
+
+        terminal_mask = torch.diag_embed(1 - masks[:, :, 0])
+        terminal_mask = F.pad(terminal_mask, (self._context_length - 1, 0), value=0)
+
+        terminal_mask = 1 - masks - terminal_mask.cumsum(dim=-1)
+        terminal_mask = 1 - terminal_mask.cumsum(dim=-2).clamp(max=1)
+        
+        transformer_mask = transformer_mask * terminal_mask
 
         hidden_states = list(range(self._num_transformer_layers))
         hidden_states = map(lambda i: memory.tensor("layer{}".format(i)).view(
@@ -470,14 +475,14 @@ class ResNetRearrangeActorCriticTransformer(RearrangeActorCriticSimpleConvTransf
         memory_mask = torch.where(transformer_mask == 0, float('-inf'), 0)
         x, *new_hidden_states = self.state_encoder(x, *hidden_states, mask=memory_mask)
 
-        transformer_mask = transformer_mask[:, -(self._context_length - 1):] * masks[:, -1]
+        transformer_mask = transformer_mask[:, -1, -(self._context_length - 1):]
         memory = memory.set_tensor("mask", transformer_mask)
 
-        for i, (state_i, new_state_i) in enumerate(zip(hidden_states, new_hidden_states)):
-            update = self.update_memory(state_i, new_state_i, sequence_len)
-            memory = memory.set_tensor("layer{}".format(i), update)
+        for i, (h, nh) in enumerate(zip(hidden_states, new_hidden_states)):
+            memory = memory.set_tensor("layer{}".format(i), torch.cat(
+                (h, nh), dim=1)[:, -(self._context_length - 1):].flatten(1))
 
-        x = (x * masks).transpose(0, 1)
+        x = x.transpose(0, 1)
 
         ac_output = ActorCriticOutput(
             distributions=self.actor(x), values=self.critic(x), extras={}
