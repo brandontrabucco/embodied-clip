@@ -71,8 +71,6 @@ class Attention(nn.Module):
 
     def forward(self, x, memory, mask = None):
 
-        print(torch.cat([memory, x], dim = 1)[0, :, 0])
-
         memory_dim, sequence_dim = memory.shape[1], x.shape[1]
         shifts, attention_bias = self.get_shifts(memory_dim, sequence_dim)
 
