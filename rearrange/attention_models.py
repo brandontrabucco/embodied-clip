@@ -45,6 +45,8 @@ class Attention(nn.Module):
         out_of_bounds = torch.logical_or(shifts < 0, shifts > self.context_length - 1)
 
         attention_bias = torch.where(out_of_bounds, float('-inf'), 0.0)
+        attention_bias = attention_bias.view(1, 1, sequence_dim, memory_dim + sequence_dim)
+
         return shifts.clamp(min = 0, max = self.context_length - 1), attention_bias
 
     @staticmethod
@@ -69,9 +71,11 @@ class Attention(nn.Module):
 
     def forward(self, x, memory, mask = None):
 
+        print(torch.cat([memory, x], dim = 1)[0, :, 0])
+
         memory_dim, sequence_dim = memory.shape[1], x.shape[1]
         shifts, attention_bias = self.get_shifts(memory_dim, sequence_dim)
-        
+
         qkv = self.to_qkv(torch.cat([memory, x], dim = 1)).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.nhead), qkv)
         
