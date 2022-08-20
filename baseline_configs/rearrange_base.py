@@ -269,7 +269,7 @@ class RearrangeBaseExperimentConfig(ExperimentConfig):
         scene_to_allowed_rearrange_inds = None
         if allowed_rearrange_inds_subset is not None:
             allowed_rearrange_inds_subset = tuple(allowed_rearrange_inds_subset)
-            assert stage in ["valid", "train_unseen"]
+            # assert stage in ["valid", "train_unseen"]
             scene_to_allowed_rearrange_inds = {
                 scene: allowed_rearrange_inds_subset for scene in allowed_scenes
             }
