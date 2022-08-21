@@ -12,8 +12,16 @@ import torch.distributed as distributed
 
 from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils.rnn import pad_sequence as pad
+from torch.distributions.categorical import Categorical
 
 import os
+import sys
+import time
+
+import queue
+import multiprocessing
+from multiprocessing import Process, Queue
+
 import tqdm
 import tree
 import numpy as np
@@ -37,7 +45,15 @@ class Policy(nn.Module):
                  dropout: float = 0.):
 
         super(Policy, self).__init__()
-        
+
+        self.hidden_size = hidden_size
+        self.num_transformer_layers = num_transformer_layers
+        self.nhead = nhead
+        self.dim_head = dim_head
+        self.dim_feedforward = dim_feedforward
+        self.context_length = context_length
+        self.dropout = dropout
+
         self.visual_attention = nn.Sequential(
             nn.Conv2d(3 * 2048, 32, 1), 
             nn.ReLU(inplace=True), 
@@ -70,6 +86,15 @@ class Policy(nn.Module):
         
         nn.init.orthogonal_(self.linear.weight, gain=0.01)
         nn.init.constant_(self.linear.bias, 0)
+
+    def create_memory(self, batch_size: int = 1, 
+                      context_length: int = 0, 
+                      device: str = 'cpu'):
+
+        shape = (batch_size, context_length, self.hidden_size)
+
+        return [torch.zeros(*shape, dtype=torch.float32, device=device) 
+                for layer in range(self.num_transformer_layers)]
 
     def forward(self, observations, *hidden_states, mask=None):
 
@@ -151,71 +176,233 @@ def get_rank():
     return distributed.get_rank()
 
 
+class RolloutEngine(Process):
+
+    def __init__(self, model: Policy, device: int, rank: int, world_size: int, 
+                 temperature: float = 0.01, queue_timeout: float = 2.0):
+
+        super(RolloutEngine, self).__init__()
+
+        self.model = model
+        self.temperature = temperature
+
+        self.device = device
+        self.rank = rank
+        self.world_size = world_size
+
+        self.in_queue = Queue()
+        self.result_queue = Queue()
+
+        self.queue_timeout = queue_timeout
+
+    def wait_for_result(self):
+
+        return self.result_queue.get()[1]
+
+    def run(self):
+
+        self._init_thor()
+
+        while self._is_alive():
+
+            try:
+                self._check_input_queue()
+            except queue.Empty:
+                continue
+
+    def _is_alive(self):
+
+        parent = multiprocessing.parent_process()
+        return not (parent is None or not parent.is_alive())
+
+    def _check_input_queue(self):
+
+        command, args, kwargs = self.in_queue.get(timeout=self.queue_timeout)
+        fn = RolloutEngine.__dict__[command]
+
+        self.result_queue.put(
+            (command, fn(self, *args, **kwargs)))
+
+    def _init_thor(self):
+
+        train_args = ExperimentConfig.stagewise_task_sampler_args(
+            stage="train", devices=[self.device], 
+            total_processes=self.world_size,
+            process_ind=self.rank)
+
+        self.train_sampler = ExperimentConfig.make_sampler_fn(
+            **train_args, force_cache_reset=False, epochs=float('inf'))
+
+        self.preprocessor = ExperimentConfig\
+            .resnet_preprocessor_graph(mode="train")
+
+        preproc = self.preprocessor.preprocessors
+        cuda_device = f"cuda:{self.device}"
+
+        preproc["rgb_resnet"].device = cuda_device
+        preproc["unshuffled_rgb_resnet"].device = cuda_device
+
+        preproc["rgb_resnet"].resnet.to(cuda_device)
+        preproc["unshuffled_rgb_resnet"].resnet.to(cuda_device)
+            
+        preproc["rgb_resnet"]._resnet = \
+            preproc["unshuffled_rgb_resnet"]._resnet
+
+    def _metrics(self):
+
+        return self.task.metrics()
+
+    def metrics(self):
+
+        self.in_queue.put(("_metrics", (), dict()))
+
+    def _update_model(self, state_dict):
+
+        self.model.load_state_dict(state_dict)
+
+    def update_model(self, state_dict):
+
+        self.in_queue.put(("_update_model", (state_dict,), dict()))
+
+    def _get_episode(self, teacher_ratio: float = 1.0):
+
+        self.task = self.train_sampler.next_task()
+
+        device = f"cuda:{self.device}"
+        self.model.eval()
+        self.model.to(device)
+        
+        memory = self.model.create_memory(
+            batch_size=1, context_length=0, device=device)
+
+        episode = []
+
+        while not self.task.is_done():
+
+            observation = self.task.get_observations()
+
+            observation["expert_action"] = torch.tensor(
+                observation["expert_action"][0], 
+                dtype=torch.int64).unsqueeze(0)
+
+            observation["rgb"] = torch.tensor(
+                observation["rgb"], 
+                dtype=torch.float32).unsqueeze(0)
+
+            observation["unshuffled_rgb"] = torch.tensor(
+                observation["unshuffled_rgb"], 
+                dtype=torch.float32).unsqueeze(0)
+
+            observation = self.preprocessor\
+                .get_observations(observation)
+
+            observation["mask"] = \
+                torch.ones([1], dtype=torch.float32)
+
+            inputs = tree.map_structure(
+                lambda x: x.to(device).unsqueeze(0), observation)
+        
+            with torch.no_grad():
+                logits, *new_memory = \
+                    self.model(inputs, *memory)
+
+            memory = tree.map_structure(
+                lambda h0, h1: torch.cat((
+                    h0, h1), dim=1), memory, new_memory)
+
+            if np.random.uniform() < teacher_ratio:
+
+                act = observation["expert_action"][0]
+
+            else:
+
+                act = Categorical(logits=logits[
+                    0, 0] / self.temperature).sample()
+
+            self.task.step(act.cpu().numpy().item())
+
+            episode.append(tree.map_structure(
+                lambda x: x.cpu(), observation))
+
+        return tree.map_structure(
+            lambda *x: torch.cat(x, dim=0), *episode)
+
+    def get_episode(self, teacher_ratio: float = 1.0):
+
+        self.in_queue.put(("_get_episode", (teacher_ratio,), dict()))
+
+
+class BatchRolloutEngine(object):
+
+    def __init__(self, model: Policy, device: int, rank: int, world_size: int, 
+                 temperature: float = 0.01, num_processes: int = 5):
+
+        self.workers = [
+            RolloutEngine(
+                model, device, i + rank * num_processes, 
+                world_size * num_processes, temperature=temperature
+            ) for i in range(num_processes)
+        ]
+
+        for w in self.workers:
+            w.start()
+
+    def update_model(self, state_dict):
+
+        for w in self.workers:
+            w.update_model(state_dict)
+
+        for w in self.workers:
+            w.wait_for_result()
+
+    def get_episode(self, teacher_ratio: float = 1.0):
+
+        for w in self.workers:
+            w.get_episode(teacher_ratio=teacher_ratio)
+
+        return [w.wait_for_result() 
+                for w in self.workers]
+
+    def metrics(self):
+
+        for w in self.workers:
+            w.metrics()
+
+        return [w.wait_for_result() 
+                for w in self.workers]
+
+
 if __name__ == "__main__":
 
+    multiprocessing.set_start_method('forkserver')
     parser = argparse.ArgumentParser()
 
+    parser.add_argument("--logdir", type=str, default="results")
+
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--batch-initial", type=int, default=20)
-    parser.add_argument("--batch-per-episode", type=int, default=3)
+    parser.add_argument("--batch-initial", type=int, default=50)
+    parser.add_argument("--batch-per-episode", type=int, default=10)
+    
+    parser.add_argument("--temperature", type=float, default=1)
+    parser.add_argument("--samplers-per-gpu", type=int, default=5)
 
     parser.add_argument("--episode-capacity", type=int, default=500)
     parser.add_argument("--initial-episodes", type=int, default=500)
 
-    parser.add_argument("--teacher-episodes", type=int, default=500)
-    parser.add_argument("--teacher-decay", type=int, default=500)
-    parser.add_argument("--model-episodes", type=int, default=10000)
+    parser.add_argument("--teacher-iterations", type=int, default=0)
+    parser.add_argument("--decay-iterations", type=int, default=500)
+    parser.add_argument("--iterations", type=int, default=10000)
 
     parser.add_argument("--context-length", type=int, default=64)
     parser.add_argument("--num-transformer-layers", type=int, default=6)
 
     args = parser.parse_args()
+    os.makedirs(args.logdir, exist_ok=True)
     
     rank, world_size = init_ddp()
     device = torch.device(f"cuda:{rank}")
 
-    train_args = ExperimentConfig.stagewise_task_sampler_args(
-        stage="train", devices=[rank], process_ind=rank, total_processes=world_size)
-
-    train_sampler = ExperimentConfig.make_sampler_fn(
-        **train_args, force_cache_reset=False, epochs=float('inf'))
-
-    clip_preprocessor = ExperimentConfig\
-        .resnet_preprocessor_graph(mode="train")
-
-    episodes = []
-
-    for iteration in tqdm.tqdm(list(range(args.initial_episodes))):
-
-        task = train_sampler.next_task()
-
-        current_episode = []
-
-        while not task.is_done():
-
-            observation = task.get_observations()
-
-            observation["expert_action"] = torch.tensor(
-                observation["expert_action"], dtype=torch.int64).unsqueeze(0)
-            observation["rgb"] = torch.tensor(
-                observation["rgb"], dtype=torch.float32).unsqueeze(0)
-            observation["unshuffled_rgb"] = torch.tensor(
-                observation["unshuffled_rgb"], dtype=torch.float32).unsqueeze(0)
-
-            observation = clip_preprocessor.get_observations(observation)
-            observation["mask"] = torch.ones([1], dtype=torch.float32)
-
-            current_episode.append(tree.map_structure(
-                lambda x: x.cpu(), observation))
-
-            act = task.query_expert()[0]
-
-            task.step(act)
-
-        episodes.append(tree.map_structure(
-            lambda *x: torch.cat(x, dim=0), *current_episode))
-
-    model = Policy(
+    unwrapped_model = model = Policy(
         len(ExperimentConfig.actions()), 
         context_length=args.context_length,
         num_transformer_layers=args.num_transformer_layers
@@ -223,73 +410,46 @@ if __name__ == "__main__":
 
     model.to(device)
 
+    rollout_engine = BatchRolloutEngine(
+        model, rank, rank, world_size, 
+        temperature=args.temperature,
+        num_processes=args.samplers_per_gpu
+    )
+
     if world_size > 1:
         model = DistributedDataParallel(
-            model, device_ids=[rank], output_device=rank)
+            model, device_ids=[rank], output_device=rank
+        )
+
+    episodes = []
+
+    for _ in tqdm.tqdm(list(range(args.initial_episodes // args.samplers_per_gpu))):
+        episodes.extend(rollout_engine.get_episode(teacher_ratio=1.0))
 
     optim = torch.optim.Adam(model.parameters(), lr=0.0001)
 
     training_steps = 0
 
-    for iteration in range(args.teacher_episodes + 
-                           args.teacher_decay + 
-                           args.model_episodes):
-
-        task = train_sampler.next_task()
-
-        hidden_states = [torch.zeros(
-            1, 0, 768, dtype=torch.float32).to(device)
-            for layer in range(args.num_transformer_layers)]
-
-        model.eval()
-
-        current_episode = []
-
-        while not task.is_done() and iteration > 0:
-
-            observation = task.get_observations()
-
-            observation["expert_action"] = torch.tensor(
-                observation["expert_action"], dtype=torch.int64).unsqueeze(0)
-            observation["rgb"] = torch.tensor(
-                observation["rgb"], dtype=torch.float32).unsqueeze(0)
-            observation["unshuffled_rgb"] = torch.tensor(
-                observation["unshuffled_rgb"], dtype=torch.float32).unsqueeze(0)
-
-            observation = clip_preprocessor.get_observations(observation)
-            observation["mask"] = torch.ones([1], dtype=torch.float32)
-
-            with torch.no_grad():
-
-                logits, *new_hidden_states = model(tree.map_structure(
-                    lambda x: x.to(device).unsqueeze(0), observation), *hidden_states)
-
-            hidden_states = tree.map_structure(lambda h0, h1: torch.cat(
-                (h0, h1), dim=1), hidden_states, new_hidden_states)
-
-            act = logits.argmax(dim=2).view(1).cpu().numpy().item()
-
-            if np.random.uniform() < (1.0 - (
-                    iteration - 1 - 
-                    args.teacher_episodes) / args.teacher_decay):
-
-                act = task.query_expert()[0]
-
-            task.step(act)
-
-            current_episode.append(tree.map_structure(
-                lambda x: x.cpu(), observation))
+    for iteration in range(args.teacher_iterations + 
+                           args.decay_iterations + 
+                           args.iterations):
 
         if iteration > 0:
 
-            episodes.append(tree.map_structure(
-                lambda *x: torch.cat(x, dim=0), *current_episode))
+            rollout_engine.update_model(unwrapped_model.state_dict())
+            episodes.extend(rollout_engine.get_episode(teacher_ratio=(
+                1.0 - (iteration - args.teacher_iterations) / args.decay_iterations
+            )))
 
-            metrics = task.metrics()
-            print(f"Iteration {iteration} Metrics:", metrics)
+            for metrics in rollout_engine.metrics():
+                print(f"Iteration {iteration} Metrics:", metrics)
 
-        if len(episodes) > args.episode_capacity:
+        while len(episodes) > args.episode_capacity:
             episodes.pop(0)
+            
+        if (iteration + 1) % 100 == 0:
+            torch.save(episodes, os.path.join(
+                args.logdir, f"episodes-{rank}.pt"))
 
         model.train()
 
@@ -302,9 +462,8 @@ if __name__ == "__main__":
         not_first_chunk = chunks[:, 1] != 0
         sampler_probabilities = (chunks[:, 1] == 0).astype(np.float32)
 
-        hidden_states = [torch.zeros(
-            chunks.shape[0], args.context_length, 768, 
-            dtype=torch.float32) for layer in range(args.num_transformer_layers)]
+        hidden_states = unwrapped_model.create_memory(
+            batch_size=chunks.shape[0], context_length=args.context_length)
 
         for repeat in range(args.batch_per_episode 
                             if iteration > 0 else 
@@ -371,9 +530,8 @@ if __name__ == "__main__":
             sampler_probabilities[batch_next_chunk_ids] = 1.0
 
             logits = logits.permute(0, 2, 1)
-            labels = batch["expert_action"][:, :, 0]
 
-            loss = F.cross_entropy(logits, labels, reduction='none')
+            loss = F.cross_entropy(logits, batch["expert_action"], reduction='none')
             loss = loss * batch["mask"]
             loss = loss.sum() / batch["mask"].sum()
 
@@ -386,4 +544,5 @@ if __name__ == "__main__":
 
         if (iteration + 1) % 100 == 0 and rank == 0:
 
-            torch.save(model.state_dict(), f"model-{iteration}.pt")
+            torch.save(unwrapped_model.state_dict(), os.path.join(
+                args.logdir, f"transformer-{iteration + 1}.pt"))
