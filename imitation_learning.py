@@ -19,8 +19,8 @@ import sys
 import time
 
 import queue
-import multiprocessing
-from multiprocessing import Process, Queue
+import torch.multiprocessing as multiprocessing
+from torch.multiprocessing import Process, Queue
 
 import glob
 import tqdm
@@ -195,7 +195,6 @@ class RolloutEngine(Process):
         self.in_queue = Queue()
         self.result_queue = Queue()
 
-
     def wait_for_result(self):
 
         return self.result_queue.get()[1]
@@ -297,6 +296,9 @@ class RolloutEngine(Process):
         self.result_queue.put(
             (command, fn(self, *args, **kwargs)))
 
+        del args
+        del kwargs
+
     def _init_thor(self):
 
         train_args = ExperimentConfig.stagewise_task_sampler_args(
@@ -376,17 +378,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--logdir", type=str, default="results_dropout")
+    parser.add_argument("--save-period", type=int, default=100)
 
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--batch-per-iteration", type=int, default=50)
     
     parser.add_argument("--temperature", type=float, default=1)
     parser.add_argument("--samplers-per-gpu", type=int, default=5)
 
     parser.add_argument("--episodes-per-iteration", type=int, default=50)
-
-    parser.add_argument("--episode-capacity", type=int, default=500)
-    parser.add_argument("--initial-episodes", type=int, default=500)
+    parser.add_argument("--episode-capacity", type=int, default=250)
 
     parser.add_argument("--teacher-iterations", type=int, default=0)
     parser.add_argument("--decay-iterations", type=int, default=500)
@@ -431,15 +432,17 @@ if __name__ == "__main__":
         )
 
     optim = torch.optim.Adam(model.parameters(), lr=0.0001)
+    training_steps = start_iteration * args.batch_per_iteration
 
     for i in range(args.episode_capacity // args.samplers_per_gpu):
         engine.get_episode(teacher_ratio=1.0)
 
-    episodes = [
-        engine.wait_for_result() for _ in tqdm.trange(
-            args.episode_capacity // args.samplers_per_gpu)
-    ]
-    training_steps = start_iteration * args.batch_per_iteration
+    episodes = []
+
+    for i in tqdm.trange(args.episode_capacity // 
+                         args.samplers_per_gpu):
+
+        episodes.extend(engine.wait_for_result())
 
     for iteration in range(start_iteration, 
                            args.teacher_iterations + 
@@ -447,25 +450,30 @@ if __name__ == "__main__":
                            args.iterations):
 
         engine.load_state_dict(unwrapped_model.state_dict())
-        for i in range(args.episodes_per_iteration // args.samplers_per_gpu):
+
+        for i in range(args.episodes_per_iteration // 
+                       args.samplers_per_gpu):
+
             engine.get_episode(teacher_ratio=(
-                1.0 - (iteration - args.teacher_iterations) / args.decay_iterations
-            ))
-        engine.get_metrics()
+                1.0 - (iteration - args.teacher_iterations) 
+                / args.decay_iterations))
 
         model.train()
 
         chunks = np.array([
             [i, j * args.context_length] 
             for i in range(len(episodes)) 
-            for j in range(int(np.ceil(episodes[i]["mask"].shape[0] / args.context_length)))
-        ])
+            for j in range(int(np.ceil(
+                episodes[i]["mask"].shape[0] / 
+                args.context_length)))])
 
         not_first_chunk = chunks[:, 1] != 0
-        sampler_probabilities = (chunks[:, 1] == 0).astype(np.float32)
+        sampler_probabilities = (
+            chunks[:, 1] == 0).astype(np.float32)
 
         hidden_states = unwrapped_model.create_memory(
-            batch_size=chunks.shape[0], context_length=args.context_length)
+            batch_size=chunks.shape[0], 
+            context_length=args.context_length)
 
         for repeat in range(args.batch_per_iteration):
 
@@ -512,14 +520,19 @@ if __name__ == "__main__":
             logits, *batch_hidden_states = model(
                 batch, *batch_hidden_states, mask=chunk_mask.to(device))
 
-            batch_next_chunk_ids = (batch_chunk_ids + 1) % sampler_probabilities.size
+            batch_next_chunk_ids = (
+                batch_chunk_ids + 1) % sampler_probabilities.size
+
+            sampler_probabilities[batch_next_chunk_ids] = 1.0
+
             next_not_first_chunk = not_first_chunk[batch_next_chunk_ids]
             next_not_first_chunk = torch.tensor(
                 next_not_first_chunk).unsqueeze(1).unsqueeze(1)
 
             if next_not_first_chunk.any():
 
-                for layer, layer_batch in zip(hidden_states, batch_hidden_states):
+                for layer, layer_batch in zip(
+                        hidden_states, batch_hidden_states):
 
                     layer[batch_next_chunk_ids] = torch.where(
                         next_not_first_chunk, 
@@ -527,11 +540,11 @@ if __name__ == "__main__":
                         layer[batch_next_chunk_ids]
                     )
 
-            sampler_probabilities[batch_next_chunk_ids] = 1.0
-
             logits = logits.permute(0, 2, 1)
 
-            loss = F.cross_entropy(logits, batch["expert_action"], reduction='none')
+            loss = F.cross_entropy(logits, batch[
+                "expert_action"], reduction='none')
+
             loss = loss * batch["mask"]
             loss = loss.sum() / batch["mask"].sum()
 
@@ -542,16 +555,23 @@ if __name__ == "__main__":
             loss = loss.detach().cpu().numpy().item()
             print(f"Training Step: {training_steps} Loss {loss}")
 
-        engine.wait_for_result()
         del episodes[:args.episodes_per_iteration]
 
-        for i in range(args.episodes_per_iteration // args.samplers_per_gpu):
+        engine.wait_for_result()
+
+        for i in tqdm.trange(args.episodes_per_iteration // 
+                             args.samplers_per_gpu):
+
             episodes.extend(engine.wait_for_result())
 
+        engine.get_metrics()
         for metrics in engine.wait_for_result():
             print(f"Iteration {iteration} Metrics:", metrics)
 
-        if (iteration + 1) % 100 == 0 and rank == 0:
+        if (iteration + 1) % args.save_period == 0 and rank == 0:
 
-            torch.save(dict(model=unwrapped_model.state_dict(), iteration=iteration), 
-                       os.path.join(args.logdir, f"transformer-{iteration + 1}.pt"))
+            model_path = os.path.join(
+                args.logdir, f"transformer-{iteration + 1}.pt")
+
+            torch.save(dict(model=unwrapped_model.state_dict(), 
+                            iteration=iteration), model_path)
