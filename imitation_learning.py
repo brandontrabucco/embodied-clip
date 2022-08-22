@@ -22,6 +22,7 @@ import queue
 import multiprocessing
 from multiprocessing import Process, Queue
 
+import glob
 import tqdm
 import tree
 import numpy as np
@@ -42,7 +43,7 @@ class Policy(nn.Module):
                  dim_head: int = 64, 
                  dim_feedforward: int = 1536, 
                  context_length: int = 64, 
-                 dropout: float = 0.):
+                 dropout: float = 0.1):
 
         super(Policy, self).__init__()
 
@@ -185,6 +186,7 @@ class RolloutEngine(Process):
 
         self.model = model
         self.temperature = temperature
+        self.queue_timeout = queue_timeout
 
         self.device = device
         self.rank = rank
@@ -193,84 +195,35 @@ class RolloutEngine(Process):
         self.in_queue = Queue()
         self.result_queue = Queue()
 
-        self.queue_timeout = queue_timeout
 
     def wait_for_result(self):
 
         return self.result_queue.get()[1]
 
-    def run(self):
-
-        self._init_thor()
-
-        while self._is_alive():
-
-            try:
-                self._check_input_queue()
-            except queue.Empty:
-                continue
-
-    def _is_alive(self):
-
-        parent = multiprocessing.parent_process()
-        return not (parent is None or not parent.is_alive())
-
-    def _check_input_queue(self):
-
-        command, args, kwargs = self.in_queue.get(timeout=self.queue_timeout)
-        fn = RolloutEngine.__dict__[command]
-
-        self.result_queue.put(
-            (command, fn(self, *args, **kwargs)))
-
-    def _init_thor(self):
-
-        train_args = ExperimentConfig.stagewise_task_sampler_args(
-            stage="train", devices=[self.device], 
-            total_processes=self.world_size,
-            process_ind=self.rank)
-
-        self.train_sampler = ExperimentConfig.make_sampler_fn(
-            **train_args, force_cache_reset=False, epochs=float('inf'))
-
-        self.preprocessor = ExperimentConfig\
-            .resnet_preprocessor_graph(mode="train")
-
-        preproc = self.preprocessor.preprocessors
-        cuda_device = f"cuda:{self.device}"
-
-        preproc["rgb_resnet"].device = cuda_device
-        preproc["unshuffled_rgb_resnet"].device = cuda_device
-
-        preproc["rgb_resnet"].resnet.to(cuda_device)
-        preproc["unshuffled_rgb_resnet"].resnet.to(cuda_device)
-            
-        preproc["rgb_resnet"]._resnet = \
-            preproc["unshuffled_rgb_resnet"]._resnet
-
-    def _metrics(self):
+    def remote_get_metrics(self):
 
         return self.task.metrics()
 
-    def metrics(self):
+    def get_metrics(self):
 
-        self.in_queue.put(("_metrics", (), dict()))
+        self.in_queue.put(("remote_get_metrics", (), dict()))
 
-    def _update_model(self, state_dict):
+    def remote_load_state_dict(self, state_dict):
 
         self.model.load_state_dict(state_dict)
 
-    def update_model(self, state_dict):
+    def load_state_dict(self, state_dict):
 
-        self.in_queue.put(("_update_model", (state_dict,), dict()))
+        self.in_queue.put(("remote_load_state_dict", (state_dict,), dict()))
 
-    def _get_episode(self, teacher_ratio: float = 1.0):
+    def remote_get_episode(self, teacher_ratio: float = 1.0):
 
         self.task = self.train_sampler.next_task()
 
         device = f"cuda:{self.device}"
-        self.model.eval()
+        
         self.model.to(device)
+        self.model.eval()
         
         memory = self.model.create_memory(
             batch_size=1, context_length=0, device=device)
@@ -329,7 +282,56 @@ class RolloutEngine(Process):
 
     def get_episode(self, teacher_ratio: float = 1.0):
 
-        self.in_queue.put(("_get_episode", (teacher_ratio,), dict()))
+        self.in_queue.put(("remote_get_episode", (teacher_ratio,), dict()))
+
+    def _is_alive(self):
+
+        parent = multiprocessing.parent_process()
+        return not (parent is None or not parent.is_alive())
+
+    def _check_input_queue(self):
+
+        command, args, kwargs = self.in_queue.get(timeout=self.queue_timeout)
+        fn = RolloutEngine.__dict__[command]
+
+        self.result_queue.put(
+            (command, fn(self, *args, **kwargs)))
+
+    def _init_thor(self):
+
+        train_args = ExperimentConfig.stagewise_task_sampler_args(
+            stage="train", devices=[self.device], 
+            total_processes=self.world_size,
+            process_ind=self.rank)
+
+        self.train_sampler = ExperimentConfig.make_sampler_fn(
+            **train_args, force_cache_reset=False, epochs=float('inf'))
+
+        self.preprocessor = ExperimentConfig\
+            .resnet_preprocessor_graph(mode="train")
+
+        preproc = self.preprocessor.preprocessors
+        cuda_device = f"cuda:{self.device}"
+
+        preproc["rgb_resnet"].device = cuda_device
+        preproc["unshuffled_rgb_resnet"].device = cuda_device
+
+        preproc["rgb_resnet"].resnet.to(cuda_device)
+        preproc["unshuffled_rgb_resnet"].resnet.to(cuda_device)
+            
+        preproc["rgb_resnet"]._resnet = \
+            preproc["unshuffled_rgb_resnet"]._resnet
+
+    def run(self):
+
+        self._init_thor()
+
+        while self._is_alive():
+
+            try:
+                self._check_input_queue()
+            except queue.Empty:
+                continue
 
 
 class BatchRolloutEngine(object):
@@ -347,29 +349,25 @@ class BatchRolloutEngine(object):
         for w in self.workers:
             w.start()
 
-    def update_model(self, state_dict):
+    def wait_for_result(self):
+
+        return [w.wait_for_result() 
+                for w in self.workers]
+
+    def load_state_dict(self, state_dict):
 
         for w in self.workers:
-            w.update_model(state_dict)
-
-        for w in self.workers:
-            w.wait_for_result()
+            w.load_state_dict(state_dict)
 
     def get_episode(self, teacher_ratio: float = 1.0):
 
         for w in self.workers:
             w.get_episode(teacher_ratio=teacher_ratio)
 
-        return [w.wait_for_result() 
-                for w in self.workers]
-
-    def metrics(self):
+    def get_metrics(self):
 
         for w in self.workers:
-            w.metrics()
-
-        return [w.wait_for_result() 
-                for w in self.workers]
+            w.get_metrics()
 
 
 if __name__ == "__main__":
@@ -377,14 +375,15 @@ if __name__ == "__main__":
     multiprocessing.set_start_method('forkserver')
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--logdir", type=str, default="results")
+    parser.add_argument("--logdir", type=str, default="results_dropout")
 
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--batch-initial", type=int, default=50)
-    parser.add_argument("--batch-per-episode", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-per-iteration", type=int, default=50)
     
     parser.add_argument("--temperature", type=float, default=1)
     parser.add_argument("--samplers-per-gpu", type=int, default=5)
+
+    parser.add_argument("--episodes-per-iteration", type=int, default=50)
 
     parser.add_argument("--episode-capacity", type=int, default=500)
     parser.add_argument("--initial-episodes", type=int, default=500)
@@ -410,8 +409,18 @@ if __name__ == "__main__":
 
     model.to(device)
 
-    rollout_engine = BatchRolloutEngine(
-        model, rank, rank, world_size, 
+    start_iteration = 0
+      
+    for ckpt in glob.glob(os.path.join(args.logdir, f"*.pt")):
+
+        ckpt = torch.load(ckpt, map_location=device)
+
+        if ckpt["iteration"] > start_iteration:
+            start_iteration = ckpt["iteration"]
+            unwrapped_model.load_state_dict(ckpt["model"])
+
+    engine = BatchRolloutEngine(
+        unwrapped_model, rank, rank, world_size, 
         temperature=args.temperature,
         num_processes=args.samplers_per_gpu
     )
@@ -421,35 +430,28 @@ if __name__ == "__main__":
             model, device_ids=[rank], output_device=rank
         )
 
-    episodes = []
-
-    for _ in tqdm.tqdm(list(range(args.initial_episodes // args.samplers_per_gpu))):
-        episodes.extend(rollout_engine.get_episode(teacher_ratio=1.0))
-
     optim = torch.optim.Adam(model.parameters(), lr=0.0001)
 
-    training_steps = 0
+    for i in range(args.episode_capacity // args.samplers_per_gpu):
+        engine.get_episode(teacher_ratio=1.0)
 
-    for iteration in range(args.teacher_iterations + 
+    episodes = [
+        engine.wait_for_result() for _ in tqdm.trange(
+            args.episode_capacity // args.samplers_per_gpu)
+    ]
+    training_steps = start_iteration * args.batch_per_iteration
+
+    for iteration in range(start_iteration, 
+                           args.teacher_iterations + 
                            args.decay_iterations + 
                            args.iterations):
 
-        if iteration > 0:
-
-            rollout_engine.update_model(unwrapped_model.state_dict())
-            episodes.extend(rollout_engine.get_episode(teacher_ratio=(
+        engine.load_state_dict(unwrapped_model.state_dict())
+        for i in range(args.episodes_per_iteration // args.samplers_per_gpu):
+            engine.get_episode(teacher_ratio=(
                 1.0 - (iteration - args.teacher_iterations) / args.decay_iterations
-            )))
-
-            for metrics in rollout_engine.metrics():
-                print(f"Iteration {iteration} Metrics:", metrics)
-
-        while len(episodes) > args.episode_capacity:
-            episodes.pop(0)
-            
-        if (iteration + 1) % 100 == 0:
-            torch.save(episodes, os.path.join(
-                args.logdir, f"episodes-{rank}.pt"))
+            ))
+        engine.get_metrics()
 
         model.train()
 
@@ -465,9 +467,7 @@ if __name__ == "__main__":
         hidden_states = unwrapped_model.create_memory(
             batch_size=chunks.shape[0], context_length=args.context_length)
 
-        for repeat in range(args.batch_per_episode 
-                            if iteration > 0 else 
-                            args.batch_initial):
+        for repeat in range(args.batch_per_iteration):
 
             batch_chunk_ids = np.random.choice(
                 sampler_probabilities.size, size=args.batch_size, 
@@ -542,7 +542,16 @@ if __name__ == "__main__":
             loss = loss.detach().cpu().numpy().item()
             print(f"Training Step: {training_steps} Loss {loss}")
 
+        engine.wait_for_result()
+        del episodes[:args.episodes_per_iteration]
+
+        for i in range(args.episodes_per_iteration // args.samplers_per_gpu):
+            episodes.extend(engine.wait_for_result())
+
+        for metrics in engine.wait_for_result():
+            print(f"Iteration {iteration} Metrics:", metrics)
+
         if (iteration + 1) % 100 == 0 and rank == 0:
 
-            torch.save(unwrapped_model.state_dict(), os.path.join(
-                args.logdir, f"transformer-{iteration + 1}.pt"))
+            torch.save(dict(model=unwrapped_model.state_dict(), iteration=iteration), 
+                       os.path.join(args.logdir, f"transformer-{iteration + 1}.pt"))
