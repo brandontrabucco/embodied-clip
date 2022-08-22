@@ -390,7 +390,7 @@ if __name__ == "__main__":
     parser.add_argument("--episode-capacity", type=int, default=250)
 
     parser.add_argument("--teacher-iterations", type=int, default=0)
-    parser.add_argument("--decay-iterations", type=int, default=500)
+    parser.add_argument("--decay-iterations", type=int, default=100)
     parser.add_argument("--iterations", type=int, default=10000)
 
     parser.add_argument("--context-length", type=int, default=64)
@@ -417,7 +417,7 @@ if __name__ == "__main__":
         ckpt = torch.load(ckpt, map_location=device)
 
         if ckpt["iteration"] > start_iteration:
-            start_iteration = ckpt["iteration"]
+            start_iteration = ckpt["iteration"] + 1
             unwrapped_model.load_state_dict(ckpt["model"])
 
     engine = BatchRolloutEngine(
@@ -434,13 +434,15 @@ if __name__ == "__main__":
     optim = torch.optim.Adam(model.parameters(), lr=0.0001)
     training_steps = start_iteration * args.batch_per_iteration
 
-    for i in range(args.episode_capacity // args.samplers_per_gpu):
+    for i in range(args.episode_capacity // 
+                   args.samplers_per_gpu):
         engine.get_episode(teacher_ratio=1.0)
 
     episodes = []
 
     for i in tqdm.trange(args.episode_capacity // 
-                         args.samplers_per_gpu):
+                         args.samplers_per_gpu, 
+                         desc=f'GPU {rank}'):
 
         episodes.extend(engine.wait_for_result())
 
@@ -503,9 +505,9 @@ if __name__ == "__main__":
 
             batch = tree.map_structure(lambda x: x.to(device), batch)
 
-            first_chunk = torch.tensor(not_first_chunk[batch_chunk_ids])
-            first_chunk = torch.logical_not(first_chunk)
-            first_chunk = first_chunk.unsqueeze(1).unsqueeze(1)
+            first_chunk = torch.logical_not(torch.tensor(
+                not_first_chunk[batch_chunk_ids])
+                ).unsqueeze(1).unsqueeze(1)
 
             first_chunk_mask = torch.cat((
                 torch.full((1, 1, args.context_length), float("-inf")), 
@@ -560,7 +562,8 @@ if __name__ == "__main__":
         engine.wait_for_result()
 
         for i in tqdm.trange(args.episodes_per_iteration // 
-                             args.samplers_per_gpu):
+                             args.samplers_per_gpu, 
+                             desc=f'GPU {rank}'):
 
             episodes.extend(engine.wait_for_result())
 
@@ -571,7 +574,7 @@ if __name__ == "__main__":
         if (iteration + 1) % args.save_period == 0 and rank == 0:
 
             model_path = os.path.join(
-                args.logdir, f"transformer-{iteration + 1}.pt")
+                args.logdir, f"transformer-{iteration}.pt")
 
             torch.save(dict(model=unwrapped_model.state_dict(), 
                             iteration=iteration), model_path)
