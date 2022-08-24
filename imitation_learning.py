@@ -20,7 +20,9 @@ import time
 
 import queue
 import torch.multiprocessing as multiprocessing
+
 from torch.multiprocessing import Process, Queue
+from collections import defaultdict
 
 import glob
 import tqdm
@@ -43,7 +45,7 @@ class Policy(nn.Module):
                  dim_head: int = 64, 
                  dim_feedforward: int = 1536, 
                  context_length: int = 64, 
-                 dropout: float = 0.1):
+                 dropout: float = 0.):
 
         super(Policy, self).__init__()
 
@@ -180,9 +182,12 @@ def get_rank():
 class RolloutEngine(Process):
 
     def __init__(self, model: Policy, device: int, rank: int, world_size: int, 
-                 temperature: float = 0.01, queue_timeout: float = 2.0):
+                 temperature: float = .001, queue_timeout: float = 2.0,
+                 data_dir: str = "bc_dataset/", stage: str = "train", 
+                 random: bool = True, context_length: int = 64):
 
         super(RolloutEngine, self).__init__()
+        os.makedirs(data_dir, exist_ok=True)
 
         self.model = model
         self.temperature = temperature
@@ -194,6 +199,13 @@ class RolloutEngine(Process):
 
         self.in_queue = Queue()
         self.result_queue = Queue()
+
+        self.data_dir = data_dir
+        self.stage = stage
+
+        self.random = random
+        self.context_length = context_length
+        self.task_to_num_samples = defaultdict(int)
 
     def wait_for_result(self):
 
@@ -219,13 +231,34 @@ class RolloutEngine(Process):
 
         self.task = self.train_sampler.next_task()
 
+        if self.random:
+
+            metadata = self.task.env.controller.step(
+                action="GetReachablePositions").metadata
+
+            valid_positions = [dict(position=position,
+                                    rotation=dict(x=0, y=rotation, z=0),
+                                    horizon=horizon, standing=standing)
+                            for position in metadata["actionReturn"]
+                            for rotation in (0, 90, 180, 270)
+                            for horizon in (-30, 0, 30, 60)
+                            for standing in (True, False)]
+
+            sampled_position = valid_positions[
+                np.random.choice(len(valid_positions))]
+            
+            self.task.env.controller.step(
+                action="TeleportFull", **sampled_position)
+
         device = f"cuda:{self.device}"
         
         self.model.to(device)
         self.model.eval()
+
+        if teacher_ratio < 1.0:
         
-        memory = self.model.create_memory(
-            batch_size=1, context_length=0, device=device)
+            memory = self.model.create_memory(
+                batch_size=1, context_length=0, device=device)
 
         episode = []
 
@@ -251,16 +284,18 @@ class RolloutEngine(Process):
             observation["mask"] = \
                 torch.ones([1], dtype=torch.float32)
 
-            inputs = tree.map_structure(
-                lambda x: x.to(device).unsqueeze(0), observation)
-        
-            with torch.no_grad():
-                logits, *new_memory = \
-                    self.model(inputs, *memory)
+            if teacher_ratio < 1.0:
 
-            memory = tree.map_structure(
-                lambda h0, h1: torch.cat((
-                    h0, h1), dim=1), memory, new_memory)
+                inputs = tree.map_structure(
+                    lambda x: x.to(device).unsqueeze(0), observation)
+            
+                with torch.no_grad():
+                    logits, *new_memory = \
+                        self.model(inputs, *memory)
+
+                memory = tree.map_structure(
+                    lambda h0, h1: torch.cat((
+                        h0, h1), dim=1), memory, new_memory)
 
             if np.random.uniform() < teacher_ratio:
 
@@ -276,8 +311,23 @@ class RolloutEngine(Process):
             episode.append(tree.map_structure(
                 lambda x: x.cpu(), observation))
 
-        return tree.map_structure(
+        episode_length = len(episode)
+
+        episode = tree.map_structure(
             lambda *x: torch.cat(x, dim=0), *episode)
+
+        scene = self.task.unshuffle_env.scene
+        index = self.task.unshuffle_env.current_task_spec.metrics.get("index")
+        stage = self.task.unshuffle_env.current_task_spec.stage
+
+        num_samples = self.task_to_num_samples[(scene, index, stage)]
+        self.task_to_num_samples[(scene, index, stage)] += 1
+
+        path = f"{scene}-{index}-{stage}-{num_samples}.pt"
+
+        for i in range(episode_length // self.context_length):
+
+            torch.save(episode, os.path.join(self.data_dir, path))
 
     def get_episode(self, teacher_ratio: float = 1.0):
 
@@ -302,7 +352,7 @@ class RolloutEngine(Process):
     def _init_thor(self):
 
         train_args = ExperimentConfig.stagewise_task_sampler_args(
-            stage="train", devices=[self.device], 
+            stage=self.stage, devices=[self.device], 
             total_processes=self.world_size,
             process_ind=self.rank)
 
@@ -310,7 +360,7 @@ class RolloutEngine(Process):
             **train_args, force_cache_reset=False, epochs=float('inf'))
 
         self.preprocessor = ExperimentConfig\
-            .resnet_preprocessor_graph(mode="train")
+            .resnet_preprocessor_graph(mode=self.stage)
 
         preproc = self.preprocessor.preprocessors
         cuda_device = f"cuda:{self.device}"
@@ -339,7 +389,7 @@ class RolloutEngine(Process):
 class BatchRolloutEngine(object):
 
     def __init__(self, model: Policy, device: int, rank: int, world_size: int, 
-                 temperature: float = 0.01, num_processes: int = 5):
+                 temperature: float = .001, num_processes: int = 5):
 
         self.workers = [
             RolloutEngine(
@@ -377,21 +427,21 @@ if __name__ == "__main__":
     multiprocessing.set_start_method('forkserver')
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--logdir", type=str, default="results_dropout")
-    parser.add_argument("--save-period", type=int, default=100)
+    parser.add_argument("--logdir", type=str, default="results_large_dataset")
+    parser.add_argument("--save-period", type=int, default=1)
 
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--batch-per-iteration", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-per-iteration", type=int, default=0)
     
-    parser.add_argument("--temperature", type=float, default=1)
+    parser.add_argument("--temperature", type=float, default=.001)
     parser.add_argument("--samplers-per-gpu", type=int, default=5)
 
-    parser.add_argument("--episodes-per-iteration", type=int, default=50)
-    parser.add_argument("--episode-capacity", type=int, default=250)
+    parser.add_argument("--episodes-per-iteration", type=int, default=0)
+    parser.add_argument("--episode-capacity", type=int, default=5000)
 
     parser.add_argument("--teacher-iterations", type=int, default=0)
-    parser.add_argument("--decay-iterations", type=int, default=100)
-    parser.add_argument("--iterations", type=int, default=10000)
+    parser.add_argument("--decay-iterations", type=int, default=0)
+    parser.add_argument("--iterations", type=int, default=0)
 
     parser.add_argument("--context-length", type=int, default=64)
     parser.add_argument("--num-transformer-layers", type=int, default=6)
@@ -438,27 +488,17 @@ if __name__ == "__main__":
                    args.samplers_per_gpu):
         engine.get_episode(teacher_ratio=1.0)
 
-    episodes = []
-
     for i in tqdm.trange(args.episode_capacity // 
                          args.samplers_per_gpu, 
                          desc=f'GPU {rank}'):
+        engine.wait_for_result()
 
-        episodes.extend(engine.wait_for_result())
+    episodes = []
 
     for iteration in range(start_iteration, 
                            args.teacher_iterations + 
                            args.decay_iterations + 
                            args.iterations):
-
-        engine.load_state_dict(unwrapped_model.state_dict())
-
-        for i in range(args.episodes_per_iteration // 
-                       args.samplers_per_gpu):
-
-            engine.get_episode(teacher_ratio=(
-                1.0 - (iteration - args.teacher_iterations) 
-                / args.decay_iterations))
 
         model.train()
 
@@ -559,6 +599,15 @@ if __name__ == "__main__":
 
         del episodes[:args.episodes_per_iteration]
 
+        engine.load_state_dict(unwrapped_model.state_dict())
+
+        for i in range(args.episodes_per_iteration // 
+                       args.samplers_per_gpu):
+
+            engine.get_episode(teacher_ratio=(
+                1.0 - (iteration - args.teacher_iterations) 
+                / args.decay_iterations))
+
         engine.wait_for_result()
 
         for i in tqdm.trange(args.episodes_per_iteration // 
@@ -568,6 +617,7 @@ if __name__ == "__main__":
             episodes.extend(engine.wait_for_result())
 
         engine.get_metrics()
+        
         for metrics in engine.wait_for_result():
             print(f"Iteration {iteration} Metrics:", metrics)
 
