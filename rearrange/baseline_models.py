@@ -680,6 +680,204 @@ class TransformerEncoder(Module):
         return x
 
 
+class ResNetRearrangeActorCriticRNNWithVoxels(RearrangeActorCriticSimpleConvRNN):
+
+    def __init__(
+        self,
+        action_space: gym.spaces.Discrete,
+        observation_space: gym.spaces.Dict,
+        rgb_uuid: str,
+        unshuffled_rgb_uuid: str,
+        num_rnn_layers=1,
+        rnn_type="GRU",
+        hidden_size=512,
+        positional_features=3,
+        voxel_features=256,
+        num_octaves=8,
+        start_octave=-5,
+        num_transformer_layers=3,
+        dim_head=64,
+        dropout=0.0,
+        activation='gelu',
+        layer_norm_eps=1e-5
+    ):
+        """A CNN->RNN rearrangement model that expects ResNet features instead
+        of RGB images.
+
+        Nearly identical to `RearrangeActorCriticSimpleConvRNN` but
+        `rgb_uuid` should now be the unique id of the ResNetPreprocessor
+        used to featurize RGB images using a pretrained ResNet before
+        they're passed to this model.
+        """
+
+        self.visual_attention: Optional[nn.Module] = None
+        locals_for_super = prepare_locals_for_super(locals())
+
+        locals_for_super.pop("positional_features")
+        locals_for_super.pop("voxel_features")
+        locals_for_super.pop("num_octaves")
+        locals_for_super.pop("start_octave")
+        locals_for_super.pop("num_transformer_layers")
+        locals_for_super.pop("dim_head")
+        locals_for_super.pop("dropout")
+        locals_for_super.pop("activation")
+        locals_for_super.pop("layer_norm_eps")
+
+        super().__init__(**locals_for_super)
+        
+        self.pos_encoding = PositionalEncoding(
+            num_octaves=num_octaves, start_octave=start_octave)
+
+        nhead = hidden_size // dim_head
+        positional_features = num_octaves * 2 * positional_features
+        
+        self.norm1 = nn.LayerNorm(positional_features)
+        self.norm2 = nn.LayerNorm(voxel_features)
+        
+        encoder_layer = TransformerEncoderLayer(
+            d_model=hidden_size, 
+            nhead=nhead, 
+            dim_feedforward=hidden_size * 2,
+            dropout=dropout, 
+            activation=activation,
+            layer_norm_eps=layer_norm_eps,
+            batch_first=True,
+            src1_dim=positional_features, 
+            src2_dim=voxel_features)
+        
+        self.transformer1 = TransformerEncoder(
+            encoder_layer, num_transformer_layers)
+        
+        self.transformer2 = TransformerEncoder(
+            encoder_layer, num_transformer_layers)
+        
+        self.register_parameter("rays_embedding", nn.Parameter(
+            torch.randn(2, 1, 1, positional_features)))
+        self.register_parameter("rgbs_embedding", nn.Parameter(
+            torch.randn(2, 1, 1, voxel_features)))
+
+    def _create_visual_encoder(self) -> nn.Module:
+        a, b = [
+            self.observation_space[k].shape[0]
+            for k in [self.rgb_uuid, self.unshuffled_rgb_uuid]
+        ]
+        assert a == b
+        self.visual_attention = nn.Sequential(
+            nn.Conv2d(3 * a, 32, 1,), nn.ReLU(inplace=True), nn.Conv2d(32, 1, 1,),
+        )
+        visual_encoder = nn.Sequential(
+            nn.Conv2d(3 * a, self._hidden_size, 1,), nn.ReLU(inplace=True),
+        )
+        self.visual_attention.apply(simple_conv_and_linear_weights_init)
+        visual_encoder.apply(simple_conv_and_linear_weights_init)
+
+        return visual_encoder
+
+    def forward(  # type:ignore
+        self,
+        observations: ObservationType,
+        memory: Memory,
+        prev_actions: torch.Tensor,
+        masks: torch.FloatTensor,
+    ) -> Tuple[ActorCriticOutput[DistributionType], Optional[Memory]]:
+        cur_img_resnet = observations[self.rgb_uuid]
+        unshuffled_img_resnet = observations[self.unshuffled_rgb_uuid]
+        concat_img = torch.cat(
+            (
+                cur_img_resnet,
+                unshuffled_img_resnet,
+                cur_img_resnet * unshuffled_img_resnet,
+            ),
+            dim=-3,
+        )
+        batch_shape, features_shape = concat_img.shape[:-3], concat_img.shape[-3:]
+        concat_img_reshaped = concat_img.view(-1, *features_shape)
+        attention_probs = torch.softmax(
+            self.visual_attention(concat_img_reshaped).view(
+                concat_img_reshaped.shape[0], -1
+            ),
+            dim=-1,
+        ).view(concat_img_reshaped.shape[0], 1, *concat_img_reshaped.shape[-2:])
+        x = (
+            (self.visual_encoder(concat_img_reshaped) * attention_probs)
+            .mean(-1)
+            .mean(-1)
+        )
+        x = x.view(*batch_shape, -1)
+
+        ############################
+        # BEGIN NERF PREPROCESSING #
+        ############################
+
+        walkthrough_voxel_positions = observations["map"]["walkthrough_voxel_positions"]
+        walkthrough_voxel_features = observations["map"]["walkthrough_voxel_features"]
+        walkthrough_voxel_mask = observations["map"]["walkthrough_voxel_mask"]
+
+        unshuffle_voxel_positions = observations["map"]["unshuffle_voxel_positions"]
+        unshuffle_voxel_features = observations["map"]["unshuffle_voxel_features"]
+        unshuffle_voxel_mask = observations["map"]["unshuffle_voxel_mask"]
+        
+        walkthrough_voxel_positions = walkthrough_voxel_positions.float().view(
+            np.prod(batch_shape), *walkthrough_voxel_positions.shape[-2:])
+        walkthrough_voxel_features = walkthrough_voxel_features.float().view(
+            np.prod(batch_shape), *walkthrough_voxel_features.shape[-2:])
+        walkthrough_voxel_mask = walkthrough_voxel_mask.float().view(
+            np.prod(batch_shape), walkthrough_voxel_mask.shape[-1])
+        
+        walkthrough_voxel_positions = self.pos_encoding(walkthrough_voxel_positions)
+
+        walkthrough_voxel_positions = walkthrough_voxel_positions + self.rays_embedding[0]
+        walkthrough_voxel_features = walkthrough_voxel_features + self.rgbs_embedding[0]
+        
+        unshuffle_voxel_positions = unshuffle_voxel_positions.float().view(
+            np.prod(batch_shape), *unshuffle_voxel_positions.shape[-2:])
+        unshuffle_voxel_features = unshuffle_voxel_features.float().view(
+            np.prod(batch_shape), *unshuffle_voxel_features.shape[-2:])
+        unshuffle_voxel_mask = unshuffle_voxel_mask.float().view(
+            np.prod(batch_shape), unshuffle_voxel_mask.shape[-1])
+        
+        unshuffle_voxel_positions = self.pos_encoding(unshuffle_voxel_positions)
+
+        unshuffle_voxel_positions = unshuffle_voxel_positions + self.rays_embedding[1]
+        unshuffle_voxel_features = unshuffle_voxel_features + self.rgbs_embedding[1]
+        
+        rays = self.norm1(torch.cat([walkthrough_voxel_positions, unshuffle_voxel_positions], dim=1))
+        rgbs = self.norm2(torch.cat([walkthrough_voxel_features, unshuffle_voxel_features], dim=1))
+        voxel_mask = 1 - torch.cat([walkthrough_voxel_mask, unshuffle_voxel_mask], dim=1)
+
+        ######################
+        # BEGIN NERF SECTION #
+        ######################
+
+        x = x.view(np.prod(batch_shape), 1, self._hidden_size)
+        x = self.transformer1(x, rays, rgbs, src_key_padding_mask=voxel_mask)
+        x = x.view(*batch_shape, self._hidden_size)
+
+        ####################
+        # END NERF SECTION #
+        ####################
+
+        x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
+
+        ######################
+        # BEGIN NERF SECTION #
+        ######################
+
+        x = x.view(np.prod(batch_shape), 1, self._hidden_size)
+        x = self.transformer2(x, rays, rgbs, src_key_padding_mask=voxel_mask)
+        x = x.view(*batch_shape, self._hidden_size)
+
+        ####################
+        # END NERF SECTION #
+        ####################
+
+        ac_output = ActorCriticOutput(
+            distributions=self.actor(x), values=self.critic(x), extras={}
+        )
+
+        return ac_output, memory.set_tensor("rnn", rnn_hidden_states)
+
+
 class ResNetRearrangeActorCriticRNNWithRays(RearrangeActorCriticSimpleConvRNN):
 
     def __init__(
