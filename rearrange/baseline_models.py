@@ -680,6 +680,119 @@ class TransformerEncoder(Module):
         return x
 
 
+class ResNetRearrangeActorCriticRNNWithVoxelExpert(RearrangeActorCriticSimpleConvRNN):
+
+    def __init__(
+        self,
+        action_space: gym.spaces.Discrete,
+        observation_space: gym.spaces.Dict,
+        rgb_uuid: str,
+        unshuffled_rgb_uuid: str,
+        num_rnn_layers=1,
+        rnn_type="GRU",
+        hidden_size=512,
+        positional_features=3,
+        voxel_features=256,
+        num_octaves=8,
+        start_octave=-5,
+    ):
+        """A CNN->RNN rearrangement model that expects ResNet features instead
+        of RGB images.
+
+        Nearly identical to `RearrangeActorCriticSimpleConvRNN` but
+        `rgb_uuid` should now be the unique id of the ResNetPreprocessor
+        used to featurize RGB images using a pretrained ResNet before
+        they're passed to this model.
+        """
+
+        self.visual_attention: Optional[nn.Module] = None
+        locals_for_super = prepare_locals_for_super(locals())
+
+        locals_for_super.pop("positional_features")
+        locals_for_super.pop("voxel_features")
+        locals_for_super.pop("num_octaves")
+        locals_for_super.pop("start_octave")
+
+        super().__init__(**locals_for_super)
+        
+        self.pos_encoding = PositionalEncoding(
+            num_octaves=num_octaves, start_octave=start_octave)
+
+        positional_features = num_octaves * 2 * positional_features
+
+        self.obs_to_hidden = nn.Sequential(
+            nn.Linear(hidden_size + 
+                      voxel_features + 
+                      positional_features, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+        )
+        
+    def _create_visual_encoder(self) -> nn.Module:
+        a, b = [
+            self.observation_space[k].shape[0]
+            for k in [self.rgb_uuid, self.unshuffled_rgb_uuid]
+        ]
+        assert a == b
+        self.visual_attention = nn.Sequential(
+            nn.Conv2d(3 * a, 32, 1,), nn.ReLU(inplace=True), nn.Conv2d(32, 1, 1,),
+        )
+        visual_encoder = nn.Sequential(
+            nn.Conv2d(3 * a, self._hidden_size, 1,), nn.ReLU(inplace=True),
+        )
+        self.visual_attention.apply(simple_conv_and_linear_weights_init)
+        visual_encoder.apply(simple_conv_and_linear_weights_init)
+
+        return visual_encoder
+
+    def forward(  # type:ignore
+        self,
+        observations: ObservationType,
+        memory: Memory,
+        prev_actions: torch.Tensor,
+        masks: torch.FloatTensor,
+    ) -> Tuple[ActorCriticOutput[DistributionType], Optional[Memory]]:
+        cur_img_resnet = observations[self.rgb_uuid]
+        unshuffled_img_resnet = observations[self.unshuffled_rgb_uuid]
+        concat_img = torch.cat(
+            (
+                cur_img_resnet,
+                unshuffled_img_resnet,
+                cur_img_resnet * unshuffled_img_resnet,
+            ),
+            dim=-3,
+        )
+        batch_shape, features_shape = concat_img.shape[:-3], concat_img.shape[-3:]
+        concat_img_reshaped = concat_img.view(-1, *features_shape)
+        attention_probs = torch.softmax(
+            self.visual_attention(concat_img_reshaped).view(
+                concat_img_reshaped.shape[0], -1
+            ),
+            dim=-1,
+        ).view(concat_img_reshaped.shape[0], 1, *concat_img_reshaped.shape[-2:])
+        x = (
+            (self.visual_encoder(concat_img_reshaped) * attention_probs)
+            .mean(-1)
+            .mean(-1)
+        )
+        x = x.view(*batch_shape, -1)
+
+        voxel_positions = observations["map"]["voxel_positions"]
+        voxel_features = observations["map"]["voxel_features"]
+        
+        x = self.obs_to_hidden(torch.cat((
+            x, voxel_features, self.pos_encoding(voxel_positions)
+        ), dim=-1))
+
+        x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
+
+        ac_output = ActorCriticOutput(
+            distributions=self.actor(x), values=self.critic(x), extras={}
+        )
+
+        return ac_output, memory.set_tensor("rnn", rnn_hidden_states)
+
+
 class ResNetRearrangeActorCriticRNNWithVoxels(RearrangeActorCriticSimpleConvRNN):
 
     def __init__(
