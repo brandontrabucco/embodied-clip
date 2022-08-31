@@ -230,56 +230,45 @@ class ExpertVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
         ])
 
 
-class FeatureMapSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
-    
-    MAX_VOXELS = 256
-    VOXEL_FEATURE_SIZE = 256
+class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
 
     DATA_DIR = "/home/ubuntu/embodied-clip/maps"
 
-    WALKTHROUGH_VOXEL_FEATURES_LABEL = "walkthrough_voxel_features"
-    UNSHUFFLE_VOXEL_FEATURES_LABEL = "unshuffle_voxel_features"
+    WALKTHROUGH_VOXEL_FEATURES_LABEL = "voxel_features_w"
+    WALKTHROUGH_VOXEL_POSITIONS_LABEL = "voxel_positions_w"
 
-    WALKTHROUGH_VOXEL_POSITIONS_LABEL = "walkthrough_voxel_positions"
-    UNSHUFFLE_VOXEL_POSITIONS_LABEL = "unshuffle_voxel_positions"
+    UNSHUFFLE_VOXEL_FEATURES_LABEL = "voxel_features_u"
+    UNSHUFFLE_VOXEL_POSITIONS_LABEL = "voxel_positions_u"
 
-    WALKTHROUGH_VOXEL_MASK_LABEL = "walkthrough_voxel_mask"
-    UNSHUFFLE_VOXEL_MASK_LABEL = "unshuffle_voxel_mask"
-
-    def __init__(self, uuid="map", use_egocentric_sensor=True):
+    def __init__(self, uuid="map", use_egocentric_sensor=True, 
+                 max_voxels=1, voxel_feature_size=256):
 
         self.use_egocentric_sensor = use_egocentric_sensor
-
-        voxel_feature_shape = [self.MAX_VOXELS, self.VOXEL_FEATURE_SIZE]
-        voxel_position_shape = [self.MAX_VOXELS, 3]
-        voxel_mask_shape = [self.MAX_VOXELS]
+        self.max_voxels = max_voxels
+        self.voxel_feature_size = voxel_feature_size
 
         observation_space = gym.spaces.Dict([
 
             (self.WALKTHROUGH_VOXEL_FEATURES_LABEL, 
-                gym.spaces.Box(np.full(voxel_feature_shape, -20.0), 
-                               np.full(voxel_feature_shape,  20.0))),
-            (self.UNSHUFFLE_VOXEL_FEATURES_LABEL, 
-                gym.spaces.Box(np.full(voxel_feature_shape, -20.0), 
-                               np.full(voxel_feature_shape,  20.0))),
+                gym.spaces.Box(np.full([self.max_voxels, self.voxel_feature_size], -20.0), 
+                               np.full([self.max_voxels, self.voxel_feature_size],  20.0))),
 
             (self.WALKTHROUGH_VOXEL_POSITIONS_LABEL, 
-                gym.spaces.Box(np.full(voxel_position_shape, -20.0), 
-                               np.full(voxel_position_shape,  20.0))),
-            (self.UNSHUFFLE_VOXEL_POSITIONS_LABEL, 
-                gym.spaces.Box(np.full(voxel_position_shape, -20.0), 
-                               np.full(voxel_position_shape,  20.0))),
+                gym.spaces.Box(np.full([self.max_voxels, 3], -20.0), 
+                               np.full([self.max_voxels, 3],  20.0))),
 
-            (self.WALKTHROUGH_VOXEL_MASK_LABEL, 
-                gym.spaces.Box(np.full(voxel_mask_shape, -20.0), 
-                               np.full(voxel_mask_shape,  20.0))),
-            (self.UNSHUFFLE_VOXEL_MASK_LABEL, 
-                gym.spaces.Box(np.full(voxel_mask_shape, -20.0), 
-                               np.full(voxel_mask_shape,  20.0))),
+            (self.UNSHUFFLE_VOXEL_FEATURES_LABEL, 
+                gym.spaces.Box(np.full([self.max_voxels, self.voxel_feature_size], -20.0), 
+                               np.full([self.max_voxels, self.voxel_feature_size],  20.0))),
+
+            (self.UNSHUFFLE_VOXEL_POSITIONS_LABEL, 
+                gym.spaces.Box(np.full([self.max_voxels, 3], -20.0), 
+                               np.full([self.max_voxels, 3],  20.0))),
 
         ])
 
         self.cache_name = None
+        self.cached_object_name = None
 
         self.cached_coords_w = None
         self.cached_feature_map_w = None
@@ -328,6 +317,48 @@ class FeatureMapSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
 
             self.cached_coords_u = cached_coords_u[indices_u]
             self.cached_feature_map_u = cached_feature_map_u[indices_u]
+
+        if task.greedy_expert is None:
+            task.query_expert(expert_sensor_group_name="attention")
+
+        if task.greedy_expert._last_to_interact_object_pose is not None:
+            self.cached_object_name = task.greedy_expert._last_to_interact_object_pose["name"]
+
+        elif env.held_object is not None:
+            self.cached_object_name = env.held_object["name"]
+
+        object_pose_w = env.obj_name_to_walkthrough_start_pose[
+            self.cached_object_name]["position"]
+        object_pose_u = env.obj_name_to_unshuffle_start_pose [
+            self.cached_object_name]["position"]
+
+        object_pose_w = np.array([
+            object_pose_w["x"], 
+            object_pose_w["z"], 
+            object_pose_w["y"]
+        ])
+
+        object_pose_u = np.array([
+            object_pose_u["x"], 
+            object_pose_u["z"], 
+            object_pose_u["y"]
+        ])
+
+        voxal_idx_w = np.linalg.norm(
+            self.cached_coords_w - 
+            object_pose_w[np.newaxis, :], 
+            axis=1).argsort()[:1]
+
+        voxal_idx_u = np.linalg.norm(
+            self.cached_coords_u - 
+            object_pose_u[np.newaxis, :], 
+            axis=1).argsort()[:1]
+
+        voxel_feature_w = self.cached_feature_map_w[voxal_idx_w]
+        voxel_feature_u = self.cached_feature_map_u[voxal_idx_u]
+
+        voxel_position_w = self.cached_coords_w[voxal_idx_w]
+        voxel_position_u = self.cached_coords_u[voxal_idx_u]
             
         location = task.env.get_agent_location()
         crouch_height_offset = 0.675 if location["standing"] else 0.0
@@ -339,43 +370,22 @@ class FeatureMapSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
             crouch_height_offset
         ])
 
-        coords_w = self.cached_coords_w - agent_current_pose[np.newaxis, :]
-        coords_u = self.cached_coords_u - agent_current_pose[np.newaxis, :]
-
-        indices_w = np.argsort(np.linalg.norm(coords_w, axis=1))[:self.MAX_VOXELS]
-        indices_u = np.argsort(np.linalg.norm(coords_u, axis=1))[:self.MAX_VOXELS]
-
-        coords_w = coords_w[indices_w]
-        coords_u = coords_u[indices_u]
-
-        features_w = self.cached_feature_map_w[indices_w]
-        features_u = self.cached_feature_map_u[indices_u]
-
-        padding_w = self.MAX_VOXELS - indices_w.size
-        padding_u = self.MAX_VOXELS - indices_u.size
+        voxel_position_w -= agent_current_pose[np.newaxis, :]
+        voxel_position_u -= agent_current_pose[np.newaxis, :]
 
         return OrderedDict([  # return rays and discrete labels
 
-            (self.WALKTHROUGH_VOXEL_FEATURES_LABEL, np.concatenate([
-                features_w,
-                np.full([padding_w, self.VOXEL_FEATURE_SIZE], 0.0)], axis=0)),
-            (self.UNSHUFFLE_VOXEL_FEATURES_LABEL, np.concatenate([
-                features_u, 
-                np.full([padding_u, self.VOXEL_FEATURE_SIZE], 0.0)], axis=0)),
+            (self.WALKTHROUGH_VOXEL_FEATURES_LABEL, 
+                voxel_feature_w.astype(np.float32)),
+            (self.UNSHUFFLE_VOXEL_FEATURES_LABEL, 
+                voxel_feature_u.astype(np.float32)),    
 
-            (self.WALKTHROUGH_VOXEL_POSITIONS_LABEL, np.concatenate([
-                coords_w,
-                np.full([padding_w, 3], 0.0)], axis=0)),
-            (self.UNSHUFFLE_VOXEL_POSITIONS_LABEL, np.concatenate([
-                coords_u, 
-                np.full([padding_u, 3], 0.0)], axis=0)),
-
-            (self.WALKTHROUGH_VOXEL_MASK_LABEL, np.concatenate([
-                np.full([indices_w.size], 1.0),
-                np.full([padding_w], 0.0)], axis=0)),
-            (self.UNSHUFFLE_VOXEL_MASK_LABEL, np.concatenate([
-                np.full([indices_u.size], 1.0), 
-                np.full([padding_u], 0.0)], axis=0))])
+            (self.WALKTHROUGH_VOXEL_POSITIONS_LABEL, 
+                voxel_position_w.astype(np.float32)),
+            (self.UNSHUFFLE_VOXEL_POSITIONS_LABEL, 
+                voxel_position_u.astype(np.float32)),
+        
+        ])
 
 
 class ExpertObjectsSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
