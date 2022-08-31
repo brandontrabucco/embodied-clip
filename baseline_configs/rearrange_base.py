@@ -339,6 +339,7 @@ class RearrangeBaseExperimentConfig(ExperimentConfig):
         if binned_pc_sensor is not None:
             binned_pc_sensor.device = torch.device(device)
 
+        """ THIS IS HANDLED EXTERNALLY
         if stage != "train":
             # Don't include several sensors during validation/testing
             kwargs["sensors"] = [
@@ -353,6 +354,8 @@ class RearrangeBaseExperimentConfig(ExperimentConfig):
                     ),
                 )
             ]
+        """
+
         return kwargs
 
     @classmethod
