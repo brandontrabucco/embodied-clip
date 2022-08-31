@@ -215,8 +215,7 @@ class HierarchicalConvRNN(ActorCriticModel[SequentialDistr]):
             emb = torch.cat((state_w, state_u), dim=2)
             emb = torch.gather(emb, 2, attention_idx).squeeze(2)
 
-            logits = self.actor(F.gelu(emb))
-            return CategoricalDistr(logits=logits)
+            return self.actor(F.gelu(emb))
 
         attention_distr = ConditionalDistr(
             distr_conditioned_on_input_fn_or_instance=attention_distr,
@@ -355,8 +354,7 @@ class PretrainedHierarchicalConvRNN(HierarchicalConvRNN):
             emb = torch.cat((state_w, state_u), dim=2)
             emb = torch.gather(emb, 2, attention_idx).squeeze(2)
 
-            logits = self.actor(F.gelu(emb))
-            return CategoricalDistr(logits=logits)
+            return self.actor(F.gelu(emb))
 
         attention_distr = ConditionalDistr(
             distr_conditioned_on_input_fn_or_instance=attention_distr,

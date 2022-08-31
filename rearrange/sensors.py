@@ -268,6 +268,7 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
         ])
 
         self.cache_name = None
+        self.cached_object_name = None
 
         self.cached_coords_w = None
         self.cached_feature_map_w = None
@@ -317,9 +318,19 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
             self.cached_coords_u = cached_coords_u[indices_u]
             self.cached_feature_map_u = cached_feature_map_u[indices_u]
 
-        object_name = task.greedy_expert._last_to_interact_object_pose["name"]
-        object_pose_w = env.obj_name_to_walkthrough_start_pose[object_name]["position"]
-        object_pose_u = env.obj_name_to_unshuffle_start_pose [object_name]["position"]
+        if task.greedy_expert is None:
+            task.query_expert(expert_sensor_group_name="attention")
+
+        if task.greedy_expert._last_to_interact_object_pose is not None:
+            self.cached_object_name = task.greedy_expert._last_to_interact_object_pose["name"]
+
+        elif env.held_object is not None:
+            self.cached_object_name = env.held_object["name"]
+
+        object_pose_w = env.obj_name_to_walkthrough_start_pose[
+            self.cached_object_name]["position"]
+        object_pose_u = env.obj_name_to_unshuffle_start_pose [
+            self.cached_object_name]["position"]
 
         object_pose_w = np.array([
             object_pose_w["x"], 

@@ -60,22 +60,29 @@ class WrappedUnshuffleTask(UnshuffleTask):
 
     @property
     def action_space(self) -> gym.spaces.Dict:
-        return gym.spaces.Dict(
-            action=super(WrappedUnshuffleTask, self).action_space,
-            attention=gym.spaces.Discrete(self.MAX_VOXELS))
+        return gym.spaces.Dict([
+            ("attention", gym.spaces.Discrete(self.MAX_VOXELS)),
+            ("action", super(WrappedUnshuffleTask, self).action_space)
+        ])
 
     def step(self, action: Dict[str, int]):
         return super(WrappedUnshuffleTask, self).step(action=action["action"])
 
     def query_expert(self, **kwargs) -> Tuple[int, bool]:
-        if kwargs["expert_sensor_group_name"] == "action":
+
+        if kwargs["expert_sensor_group_name"] == "attention":
+
             action, success = super(WrappedUnshuffleTask, self).query_expert(**kwargs)
-            self._cached_action_success = success
-        else:
+            self._cached_action_success = (action, success)
+            action = (0 if self.env.held_object is not None 
+                      else self.MAX_VOXELS // 2)
+
+        elif kwargs["expert_sensor_group_name"] == "action":
+
             assert hasattr(self, "_cached_action_success")
-            action = 0 if self.env.held_object is not None else self.MAX_VOXELS // 2
-            success = self._cached_action_success
+            action, success = self._cached_action_success
             del self._cached_action_success
+
         return action, success
 
 
@@ -85,22 +92,29 @@ class WrappedWalkthroughTask(WalkthroughTask):
 
     @property
     def action_space(self) -> gym.spaces.Dict:
-        return gym.spaces.Dict(
-            action=super(WrappedWalkthroughTask, self).action_space,
-            attention=gym.spaces.Discrete(self.MAX_VOXELS))
+        return gym.spaces.Dict([
+            ("attention", gym.spaces.Discrete(self.MAX_VOXELS)),
+            ("action", super(WrappedUnshuffleTask, self).action_space)
+        ])
 
     def step(self, action: Dict[str, int]):
         return super(WrappedWalkthroughTask, self).step(action=action["action"])
 
     def query_expert(self, **kwargs) -> Tuple[int, bool]:
-        if kwargs["expert_sensor_group_name"] == "action":
+
+        if kwargs["expert_sensor_group_name"] == "attention":
+
             action, success = super(WrappedWalkthroughTask, self).query_expert(**kwargs)
-            self._cached_action_success = success
-        else:
+            self._cached_action_success = (action, success)
+            action = (0 if self.env.held_object is not None 
+                      else self.MAX_VOXELS // 2)
+
+        elif kwargs["expert_sensor_group_name"] == "action":
+
             assert hasattr(self, "_cached_action_success")
-            action = 0 if self.env.held_object is not None else self.MAX_VOXELS // 2
-            success = self._cached_action_success
+            action, success = self._cached_action_success
             del self._cached_action_success
+
         return action, success
 
 
@@ -268,10 +282,10 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
             *super(OnePhaseRGBVoxelsDaggerExperimentConfig, cls).sensors()[:2],
             IntermediateVoxelSensor(),
             ExpertActionSensor(
-                action_space=gym.spaces.Dict(
-                    action=gym.spaces.Discrete(num_actions), 
-                    attention=gym.spaces.Discrete(cls.MAX_VOXELS)
-                )
+                action_space=gym.spaces.Dict([
+                    ("attention", gym.spaces.Discrete(cls.MAX_VOXELS)),
+                    ("action", gym.spaces.Discrete(num_actions))
+                ])
             )
         ]
 
@@ -284,7 +298,6 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
         params = super(OnePhaseRGBVoxelsDaggerExperimentConfig, 
                        cls)._use_label_to_get_training_params()
         params["lr"] = 1e-4
-        params["num_train_processes"] = 4
         return params
 
     @classmethod
@@ -317,10 +330,10 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
     def create_model(cls, **kwargs) -> nn.Module:
         num_actions = len(OnePhaseRGBVoxelsDaggerExperimentConfig.actions())
         return PretrainedHierarchicalConvRNN(
-            action_space=gym.spaces.Dict(
-                action=gym.spaces.Discrete(num_actions), 
-                attention=gym.spaces.Discrete(cls.MAX_VOXELS)
-            ),
+            action_space=gym.spaces.Dict([
+                ("attention", gym.spaces.Discrete(cls.MAX_VOXELS)),
+                ("action", gym.spaces.Discrete(num_actions))
+            ]),
             observation_space=kwargs["sensor_preprocessor_graph"].observation_spaces,
             rgb_uuid=cls.EGOCENTRIC_RGB_RESNET_UUID,
             unshuffled_rgb_uuid=cls.UNSHUFFLED_RGB_RESNET_UUID,
