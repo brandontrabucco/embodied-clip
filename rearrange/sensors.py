@@ -241,29 +241,29 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
     UNSHUFFLE_VOXEL_POSITIONS_LABEL = "voxel_positions_u"
 
     def __init__(self, uuid="map", use_egocentric_sensor=True, 
-                 max_voxels=1, voxel_feature_size=256):
+                 voxels_per_map=1, voxel_feature_size=256):
 
         self.use_egocentric_sensor = use_egocentric_sensor
-        self.max_voxels = max_voxels
+        self.max_voxels = voxels_per_map
         self.voxel_feature_size = voxel_feature_size
 
         observation_space = gym.spaces.Dict([
 
             (self.WALKTHROUGH_VOXEL_FEATURES_LABEL, 
-                gym.spaces.Box(np.full([self.max_voxels, self.voxel_feature_size], -20.0), 
-                               np.full([self.max_voxels, self.voxel_feature_size],  20.0))),
+                gym.spaces.Box(np.full([self.max_voxels * 2, self.voxel_feature_size], -20.0), 
+                               np.full([self.max_voxels * 2, self.voxel_feature_size],  20.0))),
 
             (self.WALKTHROUGH_VOXEL_POSITIONS_LABEL, 
-                gym.spaces.Box(np.full([self.max_voxels, 3], -20.0), 
-                               np.full([self.max_voxels, 3],  20.0))),
+                gym.spaces.Box(np.full([self.max_voxels * 2, 3], -20.0), 
+                               np.full([self.max_voxels * 2, 3],  20.0))),
 
             (self.UNSHUFFLE_VOXEL_FEATURES_LABEL, 
-                gym.spaces.Box(np.full([self.max_voxels, self.voxel_feature_size], -20.0), 
-                               np.full([self.max_voxels, self.voxel_feature_size],  20.0))),
+                gym.spaces.Box(np.full([self.max_voxels * 2, self.voxel_feature_size], -20.0), 
+                               np.full([self.max_voxels * 2, self.voxel_feature_size],  20.0))),
 
             (self.UNSHUFFLE_VOXEL_POSITIONS_LABEL, 
-                gym.spaces.Box(np.full([self.max_voxels, 3], -20.0), 
-                               np.full([self.max_voxels, 3],  20.0))),
+                gym.spaces.Box(np.full([self.max_voxels * 2, 3], -20.0), 
+                               np.full([self.max_voxels * 2, 3],  20.0))),
 
         ])
 
@@ -347,12 +347,22 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
         voxal_idx_w = np.linalg.norm(
             self.cached_coords_w - 
             object_pose_w[np.newaxis, :], 
-            axis=1).argsort()[:1]
+            axis=1).argsort()
 
         voxal_idx_u = np.linalg.norm(
             self.cached_coords_u - 
             object_pose_u[np.newaxis, :], 
-            axis=1).argsort()[:1]
+            axis=1).argsort()
+
+        voxal_idx_w = np.concatenate([
+            voxal_idx_w[:1], np.random.choice(
+                voxal_idx_w[1:], size=self.max_voxels - 1, replace=False)
+        ], axis=0)
+
+        voxal_idx_u = np.concatenate([
+            voxal_idx_u[:1], np.random.choice(
+                voxal_idx_u[1:], size=self.max_voxels - 1, replace=False)
+        ], axis=0)
 
         voxel_feature_w = self.cached_feature_map_w[voxal_idx_w]
         voxel_feature_u = self.cached_feature_map_u[voxal_idx_u]

@@ -54,14 +54,15 @@ from baseline_configs.one_phase.one_phase_rgb_base import (
 from baseline_configs.rearrange_base import RearrangeBaseExperimentConfig
 
 
-class WrappedUnshuffleTask(UnshuffleTask):
+VOXELS_PER_MAP = 10
 
-    MAX_VOXELS = 2
+
+class WrappedUnshuffleTask(UnshuffleTask):
 
     @property
     def action_space(self) -> gym.spaces.Dict:
         return gym.spaces.Dict([
-            ("attention", gym.spaces.Discrete(self.MAX_VOXELS)),
+            ("attention", gym.spaces.Discrete(VOXELS_PER_MAP * 2)),
             ("action", super(WrappedUnshuffleTask, self).action_space)
         ])
 
@@ -75,7 +76,7 @@ class WrappedUnshuffleTask(UnshuffleTask):
             action, success = super(WrappedUnshuffleTask, self).query_expert(**kwargs)
             self._cached_action_success = (action, success)
             action = (0 if self.env.held_object is not None 
-                      else self.MAX_VOXELS // 2)
+                      else VOXELS_PER_MAP)
 
         elif kwargs["expert_sensor_group_name"] == "action":
 
@@ -88,13 +89,11 @@ class WrappedUnshuffleTask(UnshuffleTask):
 
 class WrappedWalkthroughTask(WalkthroughTask):
 
-    MAX_VOXELS = 2
-
     @property
     def action_space(self) -> gym.spaces.Dict:
         return gym.spaces.Dict([
-            ("attention", gym.spaces.Discrete(self.MAX_VOXELS)),
-            ("action", super(WrappedUnshuffleTask, self).action_space)
+            ("attention", gym.spaces.Discrete(VOXELS_PER_MAP * 2)),
+            ("action", super(WrappedWalkthroughTask, self).action_space)
         ])
 
     def step(self, action: Dict[str, int]):
@@ -107,7 +106,7 @@ class WrappedWalkthroughTask(WalkthroughTask):
             action, success = super(WrappedWalkthroughTask, self).query_expert(**kwargs)
             self._cached_action_success = (action, success)
             action = (0 if self.env.held_object is not None 
-                      else self.MAX_VOXELS // 2)
+                      else VOXELS_PER_MAP)
 
         elif kwargs["expert_sensor_group_name"] == "action":
 
@@ -273,17 +272,15 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
     CNN_PREPROCESSOR_TYPE_AND_PRETRAINING = ("RN50", "clip")
     IL_PIPELINE_TYPE = "40proc"
 
-    MAX_VOXELS = 2
-
     @classmethod
     def sensors(cls) -> Sequence[Sensor]:
         num_actions = len(OnePhaseRGBVoxelsDaggerExperimentConfig.actions())
         return [
             *super(OnePhaseRGBVoxelsDaggerExperimentConfig, cls).sensors()[:2],
-            IntermediateVoxelSensor(),
+            IntermediateVoxelSensor(voxels_per_map=VOXELS_PER_MAP),
             ExpertActionSensor(
                 action_space=gym.spaces.Dict([
-                    ("attention", gym.spaces.Discrete(cls.MAX_VOXELS)),
+                    ("attention", gym.spaces.Discrete(VOXELS_PER_MAP * 2)),
                     ("action", gym.spaces.Discrete(num_actions))
                 ])
             )
@@ -331,7 +328,7 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
         num_actions = len(OnePhaseRGBVoxelsDaggerExperimentConfig.actions())
         return PretrainedHierarchicalConvRNN(
             action_space=gym.spaces.Dict([
-                ("attention", gym.spaces.Discrete(cls.MAX_VOXELS)),
+                ("attention", gym.spaces.Discrete(VOXELS_PER_MAP * 2)),
                 ("action", gym.spaces.Discrete(num_actions))
             ]),
             observation_space=kwargs["sensor_preprocessor_graph"].observation_spaces,
