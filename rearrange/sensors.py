@@ -241,7 +241,7 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
     UNSHUFFLE_VOXEL_POSITIONS_LABEL = "voxel_positions_u"
 
     def __init__(self, uuid="map", use_egocentric_sensor=True, 
-                 voxels_per_map=1, voxel_feature_size=256):
+                 voxels_per_map=1, voxel_feature_size=512):
 
         self.use_egocentric_sensor = use_egocentric_sensor
         self.max_voxels = voxels_per_map
@@ -304,19 +304,11 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
             cached_feature_map_u = np.load(
                 f"{cache_name}-unshuffle-feature_map.npy")
 
-            cached_hits_per_voxel_w = np.load(
-                f"{cache_name}-walkthrough-hits_per_voxel.npy")
-            cached_hits_per_voxel_u = np.load(
-                f"{cache_name}-unshuffle-hits_per_voxel.npy")
+            self.cached_coords_w = cached_coords_w
+            self.cached_feature_map_w = cached_feature_map_w
 
-            indices_w = np.nonzero(cached_hits_per_voxel_w[..., 0])
-            indices_u = np.nonzero(cached_hits_per_voxel_u[..., 0])
-
-            self.cached_coords_w = cached_coords_w[indices_w]
-            self.cached_feature_map_w = cached_feature_map_w[indices_w]
-
-            self.cached_coords_u = cached_coords_u[indices_u]
-            self.cached_feature_map_u = cached_feature_map_u[indices_u]
+            self.cached_coords_u = cached_coords_u
+            self.cached_feature_map_u = cached_feature_map_u
 
         if task.greedy_expert is None:
             task.query_expert(expert_sensor_group_name="attention")

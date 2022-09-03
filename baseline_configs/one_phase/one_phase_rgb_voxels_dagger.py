@@ -336,7 +336,7 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
             unshuffled_rgb_uuid=cls.UNSHUFFLED_RGB_RESNET_UUID,
             hidden_size=512,
             positional_features=3,
-            voxel_features=256,
+            voxel_features=512,
             num_octaves=8,
             start_octave=-5)
 

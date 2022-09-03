@@ -241,7 +241,7 @@ def transform_rays(rays, eye_vector, up_vector):
 
 
 def bin_rays(bins0, bins1, bins2, origin, rays, depth,
-             *features, min_ray_depth=0.0, max_ray_depth=10.0):
+             *features, min_ray_depth=0.1, max_ray_depth=1.5):
     """Given a set of rays and bins that specify the location and size of a
     grid of voxels, return the index of which voxel the end of each ray
     falls into, using a map_depth image to compute this point.
@@ -379,7 +379,7 @@ def update_feature_map(ind0, ind1, ind2, features, feature_map, hits_per_voxel):
     hits_per_voxel_flat.scatter_(-2, indices[..., :1], 1.0, reduce="add")
 
 
-def get_feature_map(task, voxel_size=0.2, max_images=500, feature_size=256, room_height=2.75):
+def get_feature_map(task, voxel_size=0.2, max_images=1000, feature_size=512, room_height=2.75):
 
     metadata = task.env.controller.step(action="GetReachablePositions").metadata
 
@@ -449,12 +449,12 @@ def get_feature_map(task, voxel_size=0.2, max_images=500, feature_size=256, room
             image_features = model.encode_image(image)
             image_features = image_features[0].float().permute(1, 2, 0)
 
-            focal_length = (56 / 2.0 / np.tan(np.radians(90.0) / 2.0))
+            focal_length = (28 / 2.0 / np.tan(np.radians(90.0) / 2.0))
 
-            rays = project_camera_rays(56, 56, focal_length, focal_length).cuda()
+            rays = project_camera_rays(28, 28, focal_length, focal_length).cuda()
             rays = transform_rays(rays, eye_vector, up_vector)
 
-            depth = torch.tensor(obs["depth"][2::4, 2::4]).cuda()
+            depth = torch.tensor(obs["depth"][4::8, 4::8]).cuda()
 
             ind0, ind1, ind2, image_features = bin_rays(
                 bins0, bins1, bins2, position, rays, depth, image_features)
@@ -507,7 +507,6 @@ if __name__ == "__main__":
 
     model.visual.layer4 = torch.nn.Identity()
     model.visual.layer3 = torch.nn.Identity()
-    model.visual.layer2 = torch.nn.Identity()
 
     model.eval()
 
@@ -536,16 +535,17 @@ if __name__ == "__main__":
 
             prefix = f"thor-{scene}-{index}-{stage}-walkthrough"
 
-            num_occupied = np.nonzero(hits_per_voxel)[0].size
+            occupied_indices = np.nonzero(hits_per_voxel[..., 0])
+            coords = coords[occupied_indices]
+            feature_map = feature_map[occupied_indices]
+
             print(f"[{stage}: {task_id}/{num_tasks}] \
-{prefix} {num_occupied} / {np.prod(hits_per_voxel.shape)} voxels are occupied")
+{prefix} {feature_map.shape[0]} / {np.prod(hits_per_voxel.shape)} voxels are occupied")
 
             np.save(os.path.join(
                 "maps", f"{prefix}-coords.npy"), coords)
             np.save(os.path.join(
                 "maps", f"{prefix}-feature_map.npy"), feature_map)
-            np.save(os.path.join(
-                "maps", f"{prefix}-hits_per_voxel.npy"), hits_per_voxel)
 
             # unshuffle phase
 
@@ -558,13 +558,14 @@ if __name__ == "__main__":
 
             prefix = f"thor-{scene}-{index}-{stage}-unshuffle"
 
-            num_occupied = np.nonzero(hits_per_voxel)[0].size
+            occupied_indices = np.nonzero(hits_per_voxel[..., 0])
+            coords = coords[occupied_indices]
+            feature_map = feature_map[occupied_indices]
+
             print(f"[{stage}: {task_id}/{num_tasks}] \
-{prefix} {num_occupied} / {np.prod(hits_per_voxel.shape)} voxels are occupied")
+{prefix} {feature_map.shape[0]} / {np.prod(hits_per_voxel.shape)} voxels are occupied")
 
             np.save(os.path.join(
                 "maps", f"{prefix}-coords.npy"), coords)
             np.save(os.path.join(
                 "maps", f"{prefix}-feature_map.npy"), feature_map)
-            np.save(os.path.join(
-                "maps", f"{prefix}-hits_per_voxel.npy"), hits_per_voxel)
