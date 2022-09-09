@@ -133,13 +133,33 @@ class Policy(nn.Module):
         return self.linear(self.norm(x)), *hidden_states
 
 
+class TrajectoryDataset(torch.utils.data.Dataset):
+
+    def __init__(self, dataset_files):
+        self.dataset_files = dataset_files
+        super(TrajectoryDataset, self).__init__()
+
+    def __len__(self):
+        return len(self.dataset_files)
+
+    def __getitem__(self, idx):
+        x = torch.load(self.dataset_files[idx])
+        x["mask"] = torch.ones(x["expert_action"].shape[0], dtype=torch.float32)
+        return torch.tensor([idx], dtype=torch.int64), x
+
+
+def collate_fn(batch):
+    return tree.map_structure(
+        lambda *x: pad(x, batch_first=True), *batch)
+
+
 if __name__ == "__main__":
 
     multiprocessing.set_start_method('forkserver')
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--logdir", type=str, default="results_large_dataset")
-    parser.add_argument("--data-dir", type=str, default="bc_dataset")
+    parser.add_argument("--logdir", type=str, default="results_debug")
+    parser.add_argument("--data-dir", type=str, default="large_bc_dataset")
     parser.add_argument("--save-period", type=int, default=5000)
 
     parser.add_argument("--batch-size", type=int, default=4)
@@ -149,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument("--samplers-per-gpu", type=int, default=5)
 
     parser.add_argument("--episodes-per-iteration", type=int, default=0)
-    parser.add_argument("--episode-capacity", type=int, default=5000)
+    parser.add_argument("--episode-capacity", type=int, default=0)
 
     parser.add_argument("--teacher-iterations", type=int, default=0)
     parser.add_argument("--decay-iterations", type=int, default=0)
@@ -190,25 +210,27 @@ if __name__ == "__main__":
         num_transformer_layers=args.num_transformer_layers
     )
 
-    model.to(device)
-
-    start_iteration = 0
+    iteration = -1
       
-    for ckpt in glob.glob(os.path.join(args.logdir, f"*.pt")):
+    for ckpt_name in glob.glob(os.path.join(args.logdir, f"*.pt")):
 
-        ckpt = torch.load(ckpt, map_location=device)
+        ckpt = torch.load(ckpt_name, map_location=device)
 
-        if ckpt["iteration"] > start_iteration:
-            start_iteration = ckpt["iteration"] + 1
+        if ckpt["iteration"] > iteration:
+            iteration = ckpt["iteration"] + 1
             unwrapped_model.load_state_dict(ckpt["model"])
+
+            print(f"loaded: {ckpt_name}")
+
+    model.to(device)
+    model.train()
 
     if world_size > 1:
         model = DistributedDataParallel(
             model, device_ids=[rank], output_device=rank
         )
-
+        
     optim = torch.optim.Adam(model.parameters(), lr=0.0001)
-    training_steps = start_iteration * args.batch_per_iteration
 
     scenes = list(
         sorted(
@@ -235,37 +257,49 @@ if __name__ == "__main__":
         batch_size=len(dataset_files), 
         context_length=args.context_length)
 
-    not_first_chunk = np.array([int(x[:-3].split("-")[-1]) != 0 for x in dataset_files])
+    not_first_chunk = np.array([
+        int(x[:-3].split("-")[-1]) != 0 
+        for x in dataset_files
+    ])
+
     sampler_probabilities = 1.0 - not_first_chunk.astype(np.float32)
 
-    def add_mask(x):
-        return dict(mask=torch.ones(x["expert_action"].shape[0], 
-                    device=x["expert_action"].device, dtype=torch.float32), **x)
+    class WeightedSampler(torch.utils.data.Sampler):
 
-    for iteration in range(start_iteration, 5000):
+        def __init__(self, data_source, iterations: int = 50000 * 4):
+            super(WeightedSampler, self).__init__(data_source)
+            self.iterations = iterations
 
-        model.train()
+        def __len__(self):
+            return self.iterations
 
-        batch_chunk_ids = np.random.choice(
-            sampler_probabilities.size, size=args.batch_size, 
-            replace=args.batch_size > sampler_probabilities.sum(), 
-            p=sampler_probabilities / sampler_probabilities.sum()
-        )
+        def __iter__(self):
+            for i in range(self.iterations):
+                yield np.random.choice(
+                    sampler_probabilities.size, 
+                    p=sampler_probabilities / 
+                    sampler_probabilities.sum()
+                )
 
-        batch = [
-            add_mask(torch.load(dataset_files[idx]))
-            for idx in batch_chunk_ids
-        ]
+    dataset = TrajectoryDataset(dataset_files)
+    sampler = WeightedSampler(dataset)
 
-        batch = tree.map_structure(
-            lambda *x: pad(x, batch_first=True), *batch)
+    data_loader = torch.utils.data.DataLoader(
+        dataset, sampler=sampler, 
+        batch_size=args.batch_size,
+        num_workers=4,
+        pin_memory=True,
+        collate_fn=collate_fn)
+
+    for batch_chunk_ids, batch in data_loader:
+        batch_chunk_ids = batch_chunk_ids.view(-1)
+
+        iteration += 1
 
         batch_hidden_states = [
             layer[batch_chunk_ids].to(device) 
             for layer in hidden_states
         ]
-
-        training_steps += 1
 
         batch = tree.map_structure(lambda x: x.to(device), batch)
 
@@ -319,7 +353,7 @@ if __name__ == "__main__":
         optim.step()
 
         loss = loss.detach().cpu().numpy().item()
-        print(f"Training Step: {training_steps} Loss {loss}")
+        print(f"Training Step: {iteration}  Loss: {loss}")
 
         if (iteration + 1) % args.save_period == 0 and rank == 0:
 

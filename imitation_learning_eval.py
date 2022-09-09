@@ -228,7 +228,7 @@ class RolloutEngine(Process):
     def _init_thor(self):
 
         train_args = ExperimentConfig.stagewise_task_sampler_args(
-            stage="val", devices=[self.device], 
+            stage="test", devices=[self.device], 
             total_processes=self.world_size,
             process_ind=self.rank)
 
@@ -236,7 +236,7 @@ class RolloutEngine(Process):
             **train_args, force_cache_reset=False, epochs=1)
 
         self.preprocessor = ExperimentConfig\
-            .resnet_preprocessor_graph(mode="val")
+            .resnet_preprocessor_graph(mode="test")
 
         preproc = self.preprocessor.preprocessors
         cuda_device = f"cuda:{self.device}"
@@ -400,9 +400,9 @@ if __name__ == "__main__":
     multiprocessing.set_start_method('forkserver')
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--ckpt", type=str, default="results_bc/transformer-0.pt")
+    parser.add_argument("--ckpt", type=str, default="results_debug/transformer-24999.pt")
 
-    parser.add_argument("--temperature", type=float, default=0.00001)
+    parser.add_argument("--temperature", type=float, default=1e-5)
     parser.add_argument("--samplers-per-gpu", type=int, default=5)
 
     parser.add_argument("--episodes", type=int, default=1000)
@@ -423,7 +423,8 @@ if __name__ == "__main__":
 
     model.to(device)
 
-    model.load_state_dict(torch.load(args.ckpt, map_location=device)["model"])
+    model.load_state_dict(torch.load(
+        args.ckpt, map_location=device)["model"])
 
     rollout_engine = BatchRolloutEngine(
         model, rank, rank, world_size, 
@@ -433,12 +434,15 @@ if __name__ == "__main__":
 
     metrics = []
 
-    for i in tqdm.trange(args.episodes // world_size // args.samplers_per_gpu):
+    for i in tqdm.trange(args.episodes // world_size // 
+                         args.samplers_per_gpu,
+                         desc=f"GPU {rank}"):
+
         rollout_engine.get_episode(teacher_ratio=0.0)
         metrics.extend(rollout_engine.metrics())
 
         print("Prop Fixed Strict:", np.array([
             x["unshuffle/prop_fixed_strict"] for x in metrics]).mean())
 
-        with open(args.ckpt + f".{rank}.val.json", "w") as f:
+        with open(args.ckpt + f".{rank}.test.json", "w") as f:
             json.dump(metrics, f, indent=4, cls=NumpyJSONEncoder)

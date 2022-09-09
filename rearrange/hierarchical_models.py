@@ -62,9 +62,10 @@ class HierarchicalConvRNN(ActorCriticModel[SequentialDistr]):
         num_rnn_layers=1,
         rnn_type="GRU",
         positional_features=3,
-        voxel_features=256,
+        voxel_features=512,
         num_octaves=8,
         start_octave=-5,
+        dropout=0.2,
     ):
         """Initialize a `RearrangeActorCriticSimpleConvRNN` object.
 
@@ -95,32 +96,45 @@ class HierarchicalConvRNN(ActorCriticModel[SequentialDistr]):
             num_layers=num_rnn_layers,
             rnn_type=rnn_type,
         )
-
-        self.actor = LinearActorHead(self._hidden_size, action_space["action"].n)
+        
         self.critic = LinearCriticHead(self._hidden_size)
-
-        self.train()
 
         self.pos_encoding = PositionalEncoding(
             num_octaves=num_octaves, start_octave=start_octave)
 
-        positional_features = num_octaves * 2 * positional_features
+        positional_features = (
+            num_octaves * 2 * positional_features)
 
         self.obs_to_hidden_w = nn.Sequential(
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_size +
                       voxel_features +
                       positional_features, hidden_size),
             nn.GELU(),
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_size, 1 + hidden_size),
         )
 
         self.obs_to_hidden_u = nn.Sequential(
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_size +
                       voxel_features +
                       positional_features, hidden_size),
             nn.GELU(),
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_size, 1 + hidden_size),
         )
+
+        self.actor = nn.Sequential(
+            nn.GELU(), 
+            nn.Dropout(p=dropout),
+            LinearActorHead(
+                self._hidden_size, 
+                action_space["action"].n
+            )
+        )
+            
+        self.train()
 
     def _create_visual_encoder(self) -> nn.Module:
         """Create the visual encoder for the model."""
@@ -213,9 +227,9 @@ class HierarchicalConvRNN(ActorCriticModel[SequentialDistr]):
                 x.shape[0], x.shape[1], 1, x.shape[2])
 
             emb = torch.cat((state_w, state_u), dim=2)
-            emb = torch.gather(emb, 2, attention_idx).squeeze(2)
 
-            return self.actor(F.gelu(emb))
+            return self.actor(torch.gather(
+                emb, 2, attention_idx).squeeze(2))
 
         attention_distr = ConditionalDistr(
             distr_conditioned_on_input_fn_or_instance=attention_distr,
@@ -250,9 +264,10 @@ class PretrainedHierarchicalConvRNN(HierarchicalConvRNN):
         rnn_type="GRU",
         hidden_size=512,
         positional_features=3,
-        voxel_features=256,
+        voxel_features=512,
         num_octaves=8,
         start_octave=-5,
+        dropout=0.2,
     ):
         """A CNN->RNN rearrangement model that expects ResNet features instead
         of RGB images.
@@ -315,7 +330,8 @@ class PretrainedHierarchicalConvRNN(HierarchicalConvRNN):
         )
         x = x.view(*batch_shape, -1)
 
-        x, rnn_hidden_states = self.state_encoder(x, memory.tensor("rnn"), masks)
+        x, rnn_hidden_states = self.state_encoder(
+            x, memory.tensor("rnn"), masks)
 
         ## START
 
@@ -352,9 +368,9 @@ class PretrainedHierarchicalConvRNN(HierarchicalConvRNN):
                 x.shape[0], x.shape[1], 1, x.shape[2])
 
             emb = torch.cat((state_w, state_u), dim=2)
-            emb = torch.gather(emb, 2, attention_idx).squeeze(2)
 
-            return self.actor(F.gelu(emb))
+            return self.actor(torch.gather(
+                emb, 2, attention_idx).squeeze(2))
 
         attention_distr = ConditionalDistr(
             distr_conditioned_on_input_fn_or_instance=attention_distr,

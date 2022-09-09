@@ -229,10 +229,10 @@ if __name__ == "__main__":
     multiprocessing.set_start_method('forkserver')
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--data-dir", type=str, default="bc_dataset")
+    parser.add_argument("--data-dir", type=str, default="large_bc_dataset")
     parser.add_argument("--samplers-per-gpu", type=int, default=5)
 
-    parser.add_argument("--episodes", type=int, default=5000)
+    parser.add_argument("--episodes", type=int, default=500)
     parser.add_argument("--context-length", type=int, default=64)
 
     args = parser.parse_args()
@@ -242,10 +242,11 @@ if __name__ == "__main__":
         world_size = int(os.environ["WORLD_SIZE"])
     except KeyError:
         rank, world_size = 0, 1
+    else:
         
-    distributed.init_process_group(backend="nccl")
-    print(f'Initialized process {rank} / {world_size}')
-    torch.cuda.set_device(rank)
+        distributed.init_process_group(backend="nccl")
+        print(f'Initialized process {rank} / {world_size}')
+        torch.cuda.set_device(rank)
 
     import builtins as __builtin__
     builtin_print = __builtin__.print
