@@ -487,8 +487,9 @@ if __name__ == "__main__":
         rank, world_size = 0, 1
     else:
         distributed.init_process_group(backend="nccl")
-        torch.cuda.set_device(rank)
+        torch.cuda.set_device(rank % torch.cuda.device_count())
 
+    device_id = rank % torch.cuda.device_count()
     print(f'Initialized process {rank} / {world_size}')
 
     import builtins as __builtin__
@@ -515,7 +516,7 @@ if __name__ == "__main__":
     for stage in ["train", "val", "test"]:
 
         task_sampler_args = ExperimentConfig.stagewise_task_sampler_args(
-            stage=stage, devices=[rank], process_ind=rank, total_processes=world_size)
+            stage=stage, devices=[device_id], process_ind=rank, total_processes=world_size)
 
         task_sampler = ExperimentConfig.make_sampler_fn(
             **task_sampler_args, force_cache_reset=False, epochs=1)
@@ -529,6 +530,11 @@ if __name__ == "__main__":
             task = task_sampler.next_task()
             coords, feature_map, hits_per_voxel = get_feature_map(task)
 
+            hits_per_voxel_flat = hits_per_voxel.sum(axis=2)
+
+            coords_flat = (coords * hits_per_voxel).sum(axis=2) / hits_per_voxel_flat.clip(min=1)
+            feature_map_flat = (feature_map * hits_per_voxel).sum(axis=2) / hits_per_voxel_flat.clip(min=1)
+
             scene = task.env.scene
             index = task.env.current_task_spec.metrics.get("index")
             stage = task.env.current_task_spec.stage
@@ -536,8 +542,13 @@ if __name__ == "__main__":
             prefix = f"thor-{scene}-{index}-{stage}-walkthrough"
 
             occupied_indices = np.nonzero(hits_per_voxel[..., 0])
+            occupied_indices_flat = np.nonzero(hits_per_voxel_flat[..., 0])
+            
             coords = coords[occupied_indices]
             feature_map = feature_map[occupied_indices]
+
+            coords_flat = coords_flat[occupied_indices_flat]
+            feature_map_flat = feature_map_flat[occupied_indices_flat]
 
             print(f"[{stage}: {task_id}/{num_tasks}] \
 {prefix} {feature_map.shape[0]} / {np.prod(hits_per_voxel.shape)} voxels are occupied")
@@ -547,10 +558,20 @@ if __name__ == "__main__":
             np.save(os.path.join(
                 "maps", f"{prefix}-feature_map.npy"), feature_map)
 
+            np.save(os.path.join(
+                "maps", f"{prefix}-coords_flat.npy"), coords_flat)
+            np.save(os.path.join(
+                "maps", f"{prefix}-feature_map_flat.npy"), feature_map_flat)
+
             # unshuffle phase
 
             task = task_sampler.next_task()
             coords, feature_map, hits_per_voxel = get_feature_map(task)
+
+            hits_per_voxel_flat = hits_per_voxel.sum(axis=2)
+
+            coords_flat = (coords * hits_per_voxel).sum(axis=2) / hits_per_voxel_flat.clip(min=1)
+            feature_map_flat = (feature_map * hits_per_voxel).sum(axis=2) / hits_per_voxel_flat.clip(min=1)
 
             scene = task.env.scene
             index = task.env.current_task_spec.metrics.get("index")
@@ -559,8 +580,13 @@ if __name__ == "__main__":
             prefix = f"thor-{scene}-{index}-{stage}-unshuffle"
 
             occupied_indices = np.nonzero(hits_per_voxel[..., 0])
+            occupied_indices_flat = np.nonzero(hits_per_voxel_flat[..., 0])
+
             coords = coords[occupied_indices]
             feature_map = feature_map[occupied_indices]
+
+            coords_flat = coords_flat[occupied_indices_flat]
+            feature_map_flat = feature_map_flat[occupied_indices_flat]
 
             print(f"[{stage}: {task_id}/{num_tasks}] \
 {prefix} {feature_map.shape[0]} / {np.prod(hits_per_voxel.shape)} voxels are occupied")
@@ -569,3 +595,8 @@ if __name__ == "__main__":
                 "maps", f"{prefix}-coords.npy"), coords)
             np.save(os.path.join(
                 "maps", f"{prefix}-feature_map.npy"), feature_map)
+
+            np.save(os.path.join(
+                "maps", f"{prefix}-coords_flat.npy"), coords_flat)
+            np.save(os.path.join(
+                "maps", f"{prefix}-feature_map_flat.npy"), feature_map_flat)

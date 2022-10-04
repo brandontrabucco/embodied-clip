@@ -65,7 +65,7 @@ class HierarchicalConvRNN(ActorCriticModel[SequentialDistr]):
         voxel_features=512,
         num_octaves=8,
         start_octave=-5,
-        dropout=0.2,
+        dropout=0.0,
     ):
         """Initialize a `RearrangeActorCriticSimpleConvRNN` object.
 
@@ -267,7 +267,7 @@ class PretrainedHierarchicalConvRNN(HierarchicalConvRNN):
         voxel_features=512,
         num_octaves=8,
         start_octave=-5,
-        dropout=0.2,
+        dropout=0.0,
     ):
         """A CNN->RNN rearrangement model that expects ResNet features instead
         of RGB images.

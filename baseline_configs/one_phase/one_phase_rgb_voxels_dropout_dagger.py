@@ -288,14 +288,14 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
 
     @classmethod
     def tag(cls) -> str:
-        return f"OnePhaseRGBVoxelsDagger"
+        return f"OnePhaseRGBVoxelsDropoutDagger"
 
     @classmethod
     def _use_label_to_get_training_params(cls, **kwargs):
         params = super(OnePhaseRGBVoxelsDaggerExperimentConfig, 
                        cls)._use_label_to_get_training_params()
         params["lr"] = 1e-4
-        params["num_train_processes"] = 8 * torch.cuda.device_count()
+        params["num_train_processes"] = 16
         return params
 
     @classmethod
@@ -340,7 +340,7 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
             voxel_features=512,
             num_octaves=8,
             start_octave=-5,
-            dropout=0.0)
+            dropout=0.2)
 
     @classmethod
     def make_sampler_fn(

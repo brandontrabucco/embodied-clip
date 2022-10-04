@@ -54,7 +54,7 @@ from baseline_configs.one_phase.one_phase_rgb_base import (
 from baseline_configs.rearrange_base import RearrangeBaseExperimentConfig
 
 
-VOXELS_PER_MAP = 128
+VOXELS_PER_MAP = 1000
 
 
 class WrappedUnshuffleTask(UnshuffleTask):
@@ -267,17 +267,17 @@ class WrappedRearrangeTaskSampler(RearrangeTaskSampler):
         return self._last_sampled_task
 
 
-class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig):
+class OnePhaseRGBVoxelsTopDownDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig):
     
     CNN_PREPROCESSOR_TYPE_AND_PRETRAINING = ("RN50", "clip")
     IL_PIPELINE_TYPE = "40proc"
 
     @classmethod
     def sensors(cls) -> Sequence[Sensor]:
-        num_actions = len(OnePhaseRGBVoxelsDaggerExperimentConfig.actions())
+        num_actions = len(OnePhaseRGBVoxelsTopDownDaggerExperimentConfig.actions())
         return [
-            *super(OnePhaseRGBVoxelsDaggerExperimentConfig, cls).sensors()[:2],
-            IntermediateVoxelSensor(voxels_per_map=VOXELS_PER_MAP),
+            *super(OnePhaseRGBVoxelsTopDownDaggerExperimentConfig, cls).sensors()[:2],
+            IntermediateVoxelSensor(voxels_per_map=VOXELS_PER_MAP, modifier="_flat"),
             ExpertActionSensor(
                 action_space=gym.spaces.Dict([
                     ("attention", gym.spaces.Discrete(VOXELS_PER_MAP * 2)),
@@ -288,14 +288,14 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
 
     @classmethod
     def tag(cls) -> str:
-        return f"OnePhaseRGBVoxelsDagger"
+        return f"OnePhaseRGBVoxelsTopDownDagger"
 
     @classmethod
     def _use_label_to_get_training_params(cls, **kwargs):
-        params = super(OnePhaseRGBVoxelsDaggerExperimentConfig, 
+        params = super(OnePhaseRGBVoxelsTopDownDaggerExperimentConfig, 
                        cls)._use_label_to_get_training_params()
         params["lr"] = 1e-4
-        params["num_train_processes"] = 8 * torch.cuda.device_count()
+        params["num_train_processes"] = 24
         return params
 
     @classmethod
@@ -326,7 +326,7 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
 
     @classmethod
     def create_model(cls, **kwargs) -> nn.Module:
-        num_actions = len(OnePhaseRGBVoxelsDaggerExperimentConfig.actions())
+        num_actions = len(OnePhaseRGBVoxelsTopDownDaggerExperimentConfig.actions())
         return PretrainedHierarchicalConvRNN(
             action_space=gym.spaces.Dict([
                 ("attention", gym.spaces.Discrete(VOXELS_PER_MAP * 2)),

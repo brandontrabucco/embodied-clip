@@ -98,7 +98,7 @@ class ExpertVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
     
     VOXEL_FEATURE_SIZE = 256
 
-    DATA_DIR = "/home/ubuntu/embodied-clip/maps"
+    DATA_DIR = "/home/btrabucc/embodied-clip/maps"
 
     VOXEL_FEATURES_LABEL = "voxel_features"
     VOXEL_POSITIONS_LABEL = "voxel_positions"
@@ -232,7 +232,7 @@ class ExpertVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
 
 class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
 
-    DATA_DIR = "/home/ubuntu/embodied-clip/maps"
+    DATA_DIR = "/home/btrabucc/embodied-clip/maps"
 
     WALKTHROUGH_VOXEL_FEATURES_LABEL = "voxel_features_w"
     WALKTHROUGH_VOXEL_POSITIONS_LABEL = "voxel_positions_w"
@@ -241,11 +241,13 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
     UNSHUFFLE_VOXEL_POSITIONS_LABEL = "voxel_positions_u"
 
     def __init__(self, uuid="map", use_egocentric_sensor=True, 
-                 voxels_per_map=1, voxel_feature_size=512):
+                 voxels_per_map=1, voxel_feature_size=512, modifier=""):
 
         self.use_egocentric_sensor = use_egocentric_sensor
         self.max_voxels = voxels_per_map
         self.voxel_feature_size = voxel_feature_size
+
+        self.modifier = modifier
 
         observation_space = gym.spaces.Dict([
 
@@ -295,14 +297,14 @@ class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTa
             self.cache_name = cache_name
 
             cached_coords_w = np.load(
-                f"{cache_name}-walkthrough-coords.npy")
+                f"{cache_name}-walkthrough-coords{self.modifier}.npy")
             cached_coords_u = np.load(
-                f"{cache_name}-unshuffle-coords.npy")
+                f"{cache_name}-unshuffle-coords{self.modifier}.npy")
 
             cached_feature_map_w = np.load(
-                f"{cache_name}-walkthrough-feature_map.npy")
+                f"{cache_name}-walkthrough-feature_map{self.modifier}.npy")
             cached_feature_map_u = np.load(
-                f"{cache_name}-unshuffle-feature_map.npy")
+                f"{cache_name}-unshuffle-feature_map{self.modifier}.npy")
 
             self.cached_coords_w = cached_coords_w
             self.cached_feature_map_w = cached_feature_map_w
