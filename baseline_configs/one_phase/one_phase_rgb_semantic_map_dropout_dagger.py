@@ -10,6 +10,10 @@ from rearrange.sensors import (
     ExpertObjectsSensor,
     IntermediateVoxelSensor
 )
+from rearrange.map_sensors import (
+    SemanticMapSensor, 
+    OBJECT_NAMES
+)
 from rearrange.hierarchical_models import (
     HierarchicalConvRNN,
     PretrainedHierarchicalConvRNN,
@@ -42,7 +46,6 @@ import gym.spaces
 
 from typing import Tuple, Sequence, Optional, Dict, Any
 
-import math
 import torch
 
 from allenact.algorithms.onpolicy_sync.losses.imitation import Imitation
@@ -272,16 +275,13 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
     
     CNN_PREPROCESSOR_TYPE_AND_PRETRAINING = ("RN50", "clip")
     IL_PIPELINE_TYPE = "40proc"
-    
-    DISTRIBUTED_NODES = 2
-    SQUARE_ROOT_SCALING = True
 
     @classmethod
     def sensors(cls) -> Sequence[Sensor]:
         num_actions = len(OnePhaseRGBVoxelsDaggerExperimentConfig.actions())
         return [
             *super(OnePhaseRGBVoxelsDaggerExperimentConfig, cls).sensors()[:2],
-            IntermediateVoxelSensor(voxels_per_map=VOXELS_PER_MAP),
+            SemanticMapSensor(voxels_per_map=VOXELS_PER_MAP),
             ExpertActionSensor(
                 action_space=gym.spaces.Dict([
                     ("attention", gym.spaces.Discrete(VOXELS_PER_MAP * 2)),
@@ -292,21 +292,15 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
 
     @classmethod
     def tag(cls) -> str:
-        return f"OnePhaseRGBVoxelsDropoutDaggerDistributed"
+        return f"OnePhaseRGBSemanticMapDagger"
 
     @classmethod
     def _use_label_to_get_training_params(cls, **kwargs):
         params = super(OnePhaseRGBVoxelsDaggerExperimentConfig, 
                        cls)._use_label_to_get_training_params()
-
+        params["num_mini_batch"] = 2
         params["lr"] = 1e-4
-        params["num_train_processes"] = 40
-        
-        if cls.SQUARE_ROOT_SCALING:
-            params["lr"] *= math.sqrt(cls.DISTRIBUTED_NODES)  # linear scaling
-        else:
-            params["lr"] *= cls.DISTRIBUTED_NODES  # linear scaling
-
+        params["num_train_processes"] = 80
         return params
 
     @classmethod
@@ -347,8 +341,8 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
             rgb_uuid=cls.EGOCENTRIC_RGB_RESNET_UUID,
             unshuffled_rgb_uuid=cls.UNSHUFFLED_RGB_RESNET_UUID,
             hidden_size=512,
-            positional_features=3,
-            voxel_features=512,
+            positional_features=2,
+            voxel_features=len(OBJECT_NAMES),
             num_octaves=8,
             start_octave=-5,
             dropout=0.2)
@@ -402,44 +396,3 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
             **kwargs,
         )
 
-    @classmethod
-    def machine_params(cls, mode="train", **kwargs):
-        params = super().machine_params(mode, **kwargs)
-
-        train_gpu_ids = list(range(torch.cuda.device_count()))
-
-        if mode == "train":
-            params.devices = params.devices * cls.DISTRIBUTED_NODES
-            params.nprocesses = params.nprocesses * cls.DISTRIBUTED_NODES
-            if params.sampler_devices is not None:
-                params.sampler_devices = params.sampler_devices * cls.DISTRIBUTED_NODES
-
-            if "machine_id" in kwargs:
-                machine_id = kwargs["machine_id"]
-                assert (
-                    0 <= machine_id < cls.DISTRIBUTED_NODES
-                ), f"machine_id {machine_id} out of range [0, {cls.DISTRIBUTED_NODES - 1}]"
-
-                local_worker_ids = list(
-                    range(
-                        len(train_gpu_ids) * machine_id,
-                        len(train_gpu_ids) * (machine_id + 1),
-                    )
-                )
-
-                params.set_local_worker_ids(local_worker_ids)
-
-            # Confirm we're setting up train params nicely:
-            if "machine_id" in kwargs:
-                print(
-                    f"devices {params.devices}"
-                    f"\nnprocesses {params.nprocesses}"
-                    f"\nsampler_devices {params.sampler_devices}"
-                    f"\nlocal_worker_ids {params.local_worker_ids}"
-                )
-        elif mode == "valid":
-            # Use all GPUs at their maximum capacity for training
-            # (you may run validation in a separate machine)
-            params.nprocesses = (0,)
-
-        return params

@@ -54,7 +54,7 @@ from baseline_configs.one_phase.one_phase_rgb_base import (
 from baseline_configs.rearrange_base import RearrangeBaseExperimentConfig
 
 
-VOXELS_PER_MAP = 128
+VOXELS_PER_MAP = 1024
 
 
 class WrappedUnshuffleTask(UnshuffleTask):
@@ -295,7 +295,7 @@ class OnePhaseRGBVoxelsDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig)
         params = super(OnePhaseRGBVoxelsDaggerExperimentConfig, 
                        cls)._use_label_to_get_training_params()
         params["lr"] = 1e-4
-        params["num_train_processes"] = 16
+        params["num_train_processes"] = 80
         return params
 
     @classmethod

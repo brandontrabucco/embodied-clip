@@ -98,7 +98,7 @@ class ExpertVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
     
     VOXEL_FEATURE_SIZE = 256
 
-    DATA_DIR = "/home/btrabucc/embodied-clip/maps"
+    DATA_DIR = "/home/ubuntu/embodied-clip/maps"
 
     VOXEL_FEATURES_LABEL = "voxel_features"
     VOXEL_POSITIONS_LABEL = "voxel_positions"
@@ -232,7 +232,7 @@ class ExpertVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
 
 class IntermediateVoxelSensor(Sensor[RearrangeTHOREnvironment, Union[UnshuffleTask]]):
 
-    DATA_DIR = "/home/btrabucc/embodied-clip/maps"
+    DATA_DIR = "/home/ubuntu/embodied-clip/maps"
 
     WALKTHROUGH_VOXEL_FEATURES_LABEL = "voxel_features_w"
     WALKTHROUGH_VOXEL_POSITIONS_LABEL = "voxel_positions_w"
