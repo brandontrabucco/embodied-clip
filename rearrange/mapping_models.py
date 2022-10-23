@@ -14,7 +14,7 @@ import gym
 import numpy as np
 import torch
 from einops import rearrange, repeat
-from einops.layers.torch import Rearrange
+from einops.layers.torch import Rearrange, Reduce
 from gym.spaces.dict import Dict as SpaceDict
 import torch.nn as nn
 
@@ -503,13 +503,13 @@ class VoxelMapActorCriticRNN(RearrangeActorCriticSimpleConvRNN):
         hidden_size=512,
         num_rnn_layers=1,
         rnn_type="GRU",
-        maximum_size_x: int = 480,
-        maximum_size_y: int = 480,
-        maximum_size_z: int = 56,
-        voxel_size: float = 0.05,
+        maximum_size_x: int = 240,
+        maximum_size_y: int = 240,
+        maximum_size_z: int = 28,
+        voxel_size: float = .1,
         fov: float = 90.0,
         image_size: int = 224,
-        egocentric_map_size: int = 64
+        egocentric_map_size: int = 16
     ):
     
         self.visual_attention: Optional[nn.Module] = None
@@ -538,16 +538,16 @@ class VoxelMapActorCriticRNN(RearrangeActorCriticSimpleConvRNN):
 
         grid = torch.linspace(
             -self._egocentric_map_size * voxel_size / 2, 
-            self._egocentric_map_size * voxel_size / 2, 
-            self._egocentric_map_size, 
-            dtype=torch.float32
+             self._egocentric_map_size * voxel_size / 2, 
+             self._egocentric_map_size, dtype=torch.float32
         )
 
         self.register_buffer(
             'grid', torch.stack(torch.meshgrid(
                 grid, 
                 grid, 
-                grid, indexing='ij'), 
+                grid - (self._egocentric_map_size * voxel_size / 2), 
+                indexing='ij'), 
                 dim=-1
             )
         )
@@ -555,19 +555,19 @@ class VoxelMapActorCriticRNN(RearrangeActorCriticSimpleConvRNN):
     def _create_visual_encoder(self) -> nn.Module:
 
         visual_encoder = nn.Sequential(
-            nn.Embedding(256, 8),
+            nn.Embedding(256, 32),
             Rearrange('s b h w d c q -> (s b) (c q) h w d'),
 
-            nn.Conv3d(16, 16, 5, padding=2, stride=2), 
+            nn.Conv3d(64, 64, 3, padding=1, stride=2), 
             nn.ReLU(inplace=True),
 
-            nn.Conv3d(16, 16, 5, padding=2, stride=2), 
+            nn.Conv3d(64, 64, 3, padding=1), 
             nn.ReLU(inplace=True),
 
-            nn.Conv3d(16, 32, 5, padding=2, stride=2), 
+            nn.Conv3d(64, 64, 3, padding=1, stride=2), 
             nn.ReLU(inplace=True),
             
-            nn.Conv3d(32, 64, 5, padding=2, stride=2), 
+            nn.Conv3d(64, 64, 3, padding=1), 
             nn.ReLU(inplace=True),
 
             Rearrange('b c h w d -> b (c h w d)'),

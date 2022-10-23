@@ -21,7 +21,7 @@ import gym.spaces
 class OnePhaseRGBMapDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig):
     
     CNN_PREPROCESSOR_TYPE_AND_PRETRAINING = None
-    IL_PIPELINE_TYPE = "40proc"
+    IL_PIPELINE_TYPE = "80proc"
 
     @classmethod
     def sensors(cls) -> Sequence[Sensor]:
@@ -39,7 +39,6 @@ class OnePhaseRGBMapDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig):
 
         params['num_steps'] = 32
         params["lr"] = 1e-4
-        params["num_train_processes"] = 16
 
         return params
 
@@ -48,13 +47,13 @@ class OnePhaseRGBMapDaggerExperimentConfig(OnePhaseRGBILBaseExperimentConfig):
         return VoxelMapActorCriticRNN(
             action_space=gym.spaces.Discrete(len(cls.actions())),
             observation_space=SensorSuite(cls.sensors()).observation_spaces,
-            maximum_size_x=480,
-            maximum_size_y=480,
-            maximum_size_z=56,
-            voxel_size=0.05,
+            maximum_size_x=240,
+            maximum_size_y=240,
+            maximum_size_z=28,
+            voxel_size=.1,
             fov=90.0,
             image_size=224,
-            egocentric_map_size=64
+            egocentric_map_size=16
         )
 
     @classmethod
